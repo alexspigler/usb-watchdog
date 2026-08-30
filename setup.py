@@ -17,9 +17,9 @@ OPTIONS = {
     "plist": {
         "CFBundleName": "USB Watchdog",
         "CFBundleDisplayName": "USB Watchdog",
-        "CFBundleIdentifier": "com.user.usbwatchdog",
-        "CFBundleVersion": "1.0.0",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleIdentifier": "com.alexspigler.usbwatchdog",
+        "CFBundleVersion": "1.1.0",
+        "CFBundleShortVersionString": "1.1.0",
         "LSUIElement": True,  # menu-bar-only; no Dock icon, no app menu
         "NSHumanReadableCopyright": "",
     },
@@ -30,5 +30,4 @@ setup(
     name="USB Watchdog",
     data_files=DATA_FILES,
     options={"py2app": OPTIONS},
-    setup_requires=["py2app"],
 )

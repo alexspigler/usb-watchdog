@@ -1,0 +1,6 @@
+[build-system]
+requires = [
+    "setuptools==82.0.1",
+    "py2app==0.28.10",
+]
+build-backend = "setuptools.build_meta"

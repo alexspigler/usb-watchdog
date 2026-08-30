@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""
-usb_watchdog_gui.py — macOS menu bar controller for usb_watchdog.sh
-
-A small rumps menu bar app that arms/disarms the USB/Thunderbolt/SD/HDMI
-"dead man's switch". The bash script is the detection + shutdown engine; this
-is the controller.
-
-The real watchdog runs as root (so killing it needs your admin password) and
-runs independently of this menu-bar app — quitting the app does NOT stop
-monitoring. Detection is INSTANT: any device change forces an immediate
-/sbin/halt, with no delay and no way to cancel. Dry-run mode runs as your
-user (no prompt, no shutdown) for quick testing.
-
-  Install:  python3 -m pip install rumps
-  Run:      python3 usb_watchdog_gui.py
-"""
+"""macOS menu-bar controller for the USB Watchdog shell engine."""
 
 import os
 import re
+import secrets
+import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -25,86 +13,208 @@ import time
 try:
     import rumps
 except ImportError:
-    sys.exit("Missing dependency 'rumps'. Install it with:\n"
-             "    python3 -m pip install rumps")
+    sys.exit(
+        "Missing dependency 'rumps'. Install it with:\n"
+        "    python3 -m pip install -r requirements.txt"
+    )
+
 
 if getattr(sys, "frozen", False):
-    # Running inside a py2app bundle: the script is a bundled resource.
-    _RESOURCES = os.path.normpath(
-        os.path.join(os.path.dirname(sys.executable), "..", "Resources"))
-    SCRIPT = os.path.join(_RESOURCES, "usb_watchdog.sh")
+    RESOURCES = os.path.normpath(
+        os.path.join(os.path.dirname(sys.executable), "..", "Resources")
+    )
+    SCRIPT = os.path.join(RESOURCES, "usb_watchdog.sh")
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
     SCRIPT = os.path.join(HERE, "usb_watchdog.sh")
-# Per-mode log paths. Root logs where only root can write — a fixed /tmp
-# path would let any local user pre-plant a symlink for root to clobber.
-# Dry-run logs under the user's own Library/Logs, so a root-owned leftover
-# can never block the redirect and silently kill the launch.
-LOG_ROOT = "/var/log/usb_watchdog.log"
-LOG_DRYRUN = os.path.expanduser("~/Library/Logs/usb_watchdog.log")
 
-ICON_DISARMED = "🔴"   # not armed
-ICON_ARMED = "🟢"      # armed
-ICON_DRYRUN = "🟡"     # armed in dry-run (test) mode
+USER_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/USB Watchdog")
+ROOT_STATE = "/var/run/usb-watchdog.state"
+DRY_STATE = os.path.join(USER_SUPPORT_DIR, "dry-run.state")
+ROOT_LOG = "/var/log/usb_watchdog.log"
+DRY_LOG = os.path.expanduser("~/Library/Logs/usb_watchdog.log")
 
+ICON_DISARMED = "🔴"
+ICON_ARMED = "🟢"
+ICON_DRYRUN = "🟡"
+ICON_FAULT = "🟠"
 
-def sh(cmd):
-    """Run a command list; return (returncode, stdout, stderr).
-    Decode UTF-8 explicitly: inside a py2app bundle the default locale
-    encoding is ASCII, which crashes on non-ASCII process/device names."""
-    p = subprocess.run(cmd, capture_output=True,
-                       encoding="utf-8", errors="replace")
-    return p.returncode, p.stdout, p.stderr
+STATE_TOKEN_RE = re.compile(r"^[A-Fa-f0-9-]{16,64}$")
+HEARTBEAT_STALE_SECONDS = 12
+ARM_TIMEOUT_SECONDS = 30
+PS_COMMAND = ["/usr/bin/env", "TZ=UTC", "LC_ALL=C", "/bin/ps"]
 
 
-def osascript_admin(shell_cmd):
-    """Run a shell command with the native admin password prompt.
-    Returns True on success, False if the user cancels or it fails."""
-    escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+def sh(command, timeout=10):
+    """Run an argv list and return (returncode, stdout, stderr), always bounded."""
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return completed.returncode, completed.stdout, completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return 124, stdout, stderr or "command timed out"
+    except OSError as exc:
+        return 127, "", str(exc)
+
+
+def shell_join(command):
+    """Quote fixed argv for the AppleScript administrator shell boundary."""
+    return " ".join(shlex.quote(str(part)) for part in command)
+
+
+def osascript_admin_shell(shell_command):
+    """Run one already-quoted shell command behind the native admin prompt."""
+    escaped = shell_command.replace("\\", "\\\\").replace('"', '\\"')
     apple = 'do shell script "%s" with administrator privileges' % escaped
-    rc, _, _ = sh(["osascript", "-e", apple])
-    return rc == 0
+    rc, _, stderr = sh(["/usr/bin/osascript", "-e", apple], timeout=45)
+    return rc == 0, stderr
 
 
-def watchdog_pids():
-    """PIDs of running monitor processes. Excludes the --snapshot helper,
-    this GUI (its command line never contains 'usb_watchdog.sh'), and the
-    monitor's own transient command-substitution forks — those forks show
-    the same command line, so any match whose parent is also a match is
-    dropped rather than counted as a separate watchdog."""
-    rc, out, _ = sh(["ps", "-axo", "pid=,ppid=,command="])
-    matches = []
-    for line in out.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) != 3:
+def osascript_admin(command):
+    return osascript_admin_shell(shell_join(command))
+
+
+def _state_owner_is_valid(state_path, owner_uid):
+    if state_path == ROOT_STATE:
+        return owner_uid == 0
+    return owner_uid == os.getuid()
+
+
+def _read_state_data(state_path):
+    """Read a regular, correctly owned state file without following symlinks."""
+    try:
+        info = os.lstat(state_path)
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return None
+        if not _state_owner_is_valid(state_path, info.st_uid):
+            return None
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return None
+        with open(state_path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+
+    data = {}
+    for line in lines:
+        if "=" not in line:
             continue
-        pid, ppid, cmd = parts
-        if "usb_watchdog.sh" in cmd and "--snapshot" not in cmd:
-            matches.append((int(pid), int(ppid)))
-    all_pids = {pid for pid, _ in matches}
-    return [pid for pid, ppid in matches if ppid not in all_pids]
+        key, value = line.split("=", 1)
+        data[key] = value
+
+    try:
+        pid = int(data["pid"])
+        uid = int(data["uid"])
+        heartbeat = int(data["heartbeat"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    token = data.get("token", "")
+    started = data.get("started", "").strip()
+    mode = data.get("mode", "")
+    status = data.get("status", "unknown")
+    if (
+        data.get("version") != "1"
+        or pid <= 1
+        or uid < 0
+        or not STATE_TOKEN_RE.fullmatch(token)
+        or not started
+    ):
+        return None
+    if mode not in {"real", "dry-run"}:
+        return None
+
+    data.update(
+        {
+            "path": state_path,
+            "pid": pid,
+            "uid": uid,
+            "heartbeat": heartbeat,
+            "token": token,
+            "started": started,
+            "mode": mode,
+            "status": status,
+        }
+    )
+    return data
 
 
-def pid_is_root(pid):
-    rc, out, _ = sh(["ps", "-o", "user=", "-p", str(pid)])
-    return rc == 0 and out.strip() == "root"
+def _process_matches_state(state):
+    """Validate PID, UID, engine name, and per-launch token together."""
+    rc, output, _ = sh(
+        PS_COMMAND
+        + ["-ww", "-p", str(state["pid"]), "-o", "uid=,command="],
+        timeout=2,
+    )
+    if rc != 0 or not output.strip():
+        return False
+    parts = output.strip().split(None, 1)
+    if len(parts) != 2:
+        return False
+    try:
+        process_uid = int(parts[0])
+    except ValueError:
+        return False
+    command = parts[1]
+    marker = "--instance-token %s" % state["token"]
+    command_matches = (
+        process_uid == state["uid"]
+        and "usb_watchdog.sh" in command
+        and marker in command
+    )
+    if not command_matches:
+        return False
+    rc, started, _ = sh(
+        PS_COMMAND + ["-p", str(state["pid"]), "-o", "lstart="], timeout=2
+    )
+    return rc == 0 and started.strip() == state["started"]
+
+
+def read_instance(state_path, now=None):
+    """Return registered instance state, including stale/faulted records."""
+    state = _read_state_data(state_path)
+    if state is None:
+        return None
+    if now is None:
+        now = int(time.time())
+    state["alive"] = _process_matches_state(state)
+    state["age"] = now - state["heartbeat"]
+    state["healthy"] = (
+        state["alive"]
+        and state["status"] == "ready"
+        and 0 <= state["age"] <= HEARTBEAT_STALE_SECONDS
+    )
+    return state
+
+
+def watchdog_instances():
+    """Inspect only the two state files owned by this controller."""
+    instances = []
+    for state_path in (ROOT_STATE, DRY_STATE):
+        instance = read_instance(state_path)
+        if instance is not None:
+            instances.append(instance)
+    return instances
 
 
 def pretty_device(line):
     if line.startswith("USB:"):
-        # USB:port=<loc> <vid>:<pid> sn=<serial> <name>
-        m = re.match(r"USB:port=(\S+) (\S+) sn=(\S*) (.+)", line)
-        if m:
-            loc, _vidpid, sn, name = m.groups()
-            tag = " · #%s" % sn if sn else ""
-            return "USB · %s (port %s)%s" % (name, loc, tag)
+        match = re.match(r"USB:port=(\S+) (\S+) sn=(\S*) (.+)", line)
+        if match:
+            location, _vendor_product, serial, name = match.groups()
+            serial_tag = " · #%s" % serial if serial else ""
+            return "USB · %s (port %s)%s" % (name, location, serial_tag)
         return "USB · " + line[4:]
     if line.startswith("TB:"):
-        # TB:uid=<uid> <vendor> / <name>
-        m = re.match(r"TB:uid=(\S+) (.+)", line)
-        if m:
-            return "Thunderbolt · " + m.group(2)
-        return "Thunderbolt · " + line[3:]
+        match = re.match(r"TB:uid=(\S+) (.+)", line)
+        return "Thunderbolt · " + (match.group(2) if match else line[3:])
     if line.startswith("SD:"):
         return "SD card · " + line[3:]
     if line.startswith("DISPLAY:"):
@@ -113,7 +223,6 @@ def pretty_device(line):
 
 
 def notify(title, subtitle, message):
-    """Best-effort notification; silently ignored if not bundled."""
     try:
         rumps.notification(title, subtitle, message)
     except Exception:
@@ -124,16 +233,21 @@ class WatchdogApp(rumps.App):
     def __init__(self):
         super().__init__(ICON_DISARMED, quit_button=None)
         self.dry_run = False
+        self.strict_wake = False
+        self._tick = 0
+        self._previously_healthy = False
+        self._fault_notified = False
 
         self.status_item = rumps.MenuItem("● Disarmed")
-        self.status_item.set_callback(None)  # info only
+        self.status_item.set_callback(None)
         self.toggle_item = rumps.MenuItem("Arm", callback=self.on_toggle)
-
-        self.dryrun_item = rumps.MenuItem("Dry-run (test, no shutdown)",
-                                          callback=self.on_toggle_dryrun)
-
+        self.dryrun_item = rumps.MenuItem(
+            "Dry-run (test, no shutdown)", callback=self.on_toggle_dryrun
+        )
+        self.wake_item = rumps.MenuItem(
+            "Strict wake (shut down after sleep)", callback=self.on_toggle_wake
+        )
         self.devices_menu = rumps.MenuItem("Devices")
-        # Seed the submenu so its NSMenu exists before refresh() calls clear().
         self.devices_menu.add(rumps.MenuItem("(scanning…)"))
 
         self.menu = [
@@ -142,174 +256,246 @@ class WatchdogApp(rumps.App):
             self.toggle_item,
             None,
             self.dryrun_item,
+            self.wake_item,
             None,
             self.devices_menu,
             None,
             rumps.MenuItem("Quit", callback=self.on_quit),
         ]
 
-        # Menu-display refresh only (status icon + device list). This is
-        # independent of the watchdog's own detection loop, so a slower cadence
-        # here saves idle CPU with zero effect on how fast it reacts.
-        self._tick = 0
         self.timer = rumps.Timer(self.refresh, 4)
         self.timer.start()
         self.refresh(None)
 
-    # --- settings ---
     def on_toggle_dryrun(self, sender):
         self.dry_run = not self.dry_run
         sender.state = 1 if self.dry_run else 0
 
-    # --- arm / disarm ---
+    def on_toggle_wake(self, sender):
+        self.strict_wake = not self.strict_wake
+        sender.state = 1 if self.strict_wake else 0
+
     def on_toggle(self, _):
-        if watchdog_pids():
+        if watchdog_instances():
             self.disarm()
         else:
             self.arm()
 
+    def _launch_arguments(self, token, state_path):
+        arguments = [
+            "/bin/bash",
+            SCRIPT,
+            "--wake-policy",
+            "shutdown" if self.strict_wake else "compare",
+            "--state-file",
+            state_path,
+            "--instance-token",
+            token,
+        ]
+        if self.dry_run:
+            arguments.append("--dry-run")
+        return arguments
+
     def arm(self):
-        if not os.path.exists(SCRIPT):
+        if not os.path.isfile(SCRIPT):
             rumps.alert("Cannot find usb_watchdog.sh", "Expected at:\n" + SCRIPT)
             return
-        cmd_args = "--dry-run" if self.dry_run else ""
-        log = LOG_DRYRUN if self.dry_run else LOG_ROOT
-        # Subshell backgrounding (no nohup): nohup fails with "can't detach
-        # from console" when launched via the admin-privilege mechanism,
-        # which has no controlling terminal. ( ... & ) detaches cleanly and
-        # the process is reparented to launchd so it survives.
-        launch = ("( /bin/bash '%s' %s </dev/null >'%s' 2>&1 & )"
-                  % (SCRIPT, cmd_args, log))
+
+        token = secrets.token_hex(16)
+        state_path = DRY_STATE if self.dry_run else ROOT_STATE
+        log_path = DRY_LOG if self.dry_run else ROOT_LOG
+        arguments = self._launch_arguments(token, state_path)
 
         if self.dry_run:
-            subprocess.Popen(["/bin/bash", "-c", launch], start_new_session=True)
-            launched = True
+            os.makedirs(os.path.dirname(DRY_STATE), mode=0o700, exist_ok=True)
+            os.makedirs(os.path.dirname(DRY_LOG), mode=0o700, exist_ok=True)
+            try:
+                with open(log_path, "ab", buffering=0) as log_handle:
+                    subprocess.Popen(
+                        arguments,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                launched = True
+                launch_error = ""
+            except OSError as exc:
+                launched = False
+                launch_error = str(exc)
         else:
-            launched = osascript_admin(launch)  # native password prompt
+            launch = "( %s </dev/null >>%s 2>&1 & )" % (
+                shell_join(arguments),
+                shlex.quote(log_path),
+            )
+            launched, launch_error = osascript_admin_shell(launch)
 
-        # A successful launch attempt is not a running watchdog — the script
-        # can die instantly (bad redirect, syntax error). Only claim Armed
-        # once a monitor process actually appears; otherwise fail loud.
         armed = False
+        last_state = None
         if launched:
-            for _ in range(8):
-                if watchdog_pids():
+            deadline = time.monotonic() + ARM_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                last_state = read_instance(state_path)
+                if (
+                    last_state
+                    and last_state["token"] == token
+                    and last_state["healthy"]
+                ):
                     armed = True
                     break
                 time.sleep(0.25)
 
         if armed:
-            notify("USB Watchdog", "Armed",
-                   "Monitoring USB/Thunderbolt/SD/HDMI — instant shutdown%s."
-                   % (" (dry-run)" if self.dry_run else ""))
-        elif launched:
-            tail = ""
-            try:
-                with open(log, encoding="utf-8", errors="replace") as f:
-                    tail = f.read()[-500:].strip()
-            except OSError:
-                pass
-            rumps.alert("Arm failed",
-                        "The watchdog did not start.\n\nLog (%s):\n%s"
-                        % (log, tail or "(no output)"))
+            mode_text = "dry-run" if self.dry_run else "real"
+            notify(
+                "USB Watchdog",
+                "Armed",
+                "Validated baseline ready in %s mode; wake policy: %s."
+                % (mode_text, "shutdown" if self.strict_wake else "compare"),
+            )
+        else:
+            detail = launch_error.strip()
+            if last_state:
+                detail = last_state.get("detail", "") or last_state.get("status", "")
+            if not detail:
+                try:
+                    with open(log_path, encoding="utf-8", errors="replace") as handle:
+                        detail = handle.read()[-800:].strip()
+                except OSError:
+                    detail = ""
+            rumps.alert(
+                "Arm failed",
+                "The watchdog never reported a healthy, validated baseline.\n\n%s"
+                % (detail or "No diagnostic output was available."),
+            )
         self.refresh(None)
 
+    def _stop_instance(self, instance):
+        command = [
+            "/bin/bash",
+            SCRIPT,
+            "--stop",
+            "--state-file",
+            instance["path"],
+            "--instance-token",
+            instance["token"],
+        ]
+        if instance["uid"] == 0:
+            return osascript_admin(command)
+        rc, _, stderr = sh(command, timeout=25)
+        return rc == 0, stderr
+
     def disarm(self):
-        pids = watchdog_pids()
-        if not pids:
+        instances = watchdog_instances()
+        if not instances:
             return
-        root = any(pid_is_root(p) for p in pids)
 
-        # Use SIGKILL, not SIGTERM. When the watchdog is launched with
-        # administrator privileges, it inherits SIGTERM set to ignored, so
-        # bash's `trap` is a silent no-op and SIGTERM never stops it. SIGKILL
-        # cannot be caught, blocked, or ignored.
-        # Kill by explicit PID plus a pkill fallback; the [u]/[.] brackets stop
-        # the command from matching its own helper shell. Errors on already-
-        # dead PIDs are swallowed so the privileged call still returns success.
-        pidlist = " ".join(str(p) for p in pids)
-        kill_cmd = ("kill -9 %s 2>/dev/null; "
-                    "pkill -9 -f '[u]sb_watchdog[.]sh' 2>/dev/null; true"
-                    % pidlist)
-        if root:
-            osascript_admin(kill_cmd)  # native password prompt
+        errors = []
+        for instance in instances:
+            stopped, error = self._stop_instance(instance)
+            if not stopped:
+                errors.append(error.strip() or "Could not stop PID %s" % instance["pid"])
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and watchdog_instances():
+            time.sleep(0.2)
+        leftovers = watchdog_instances()
+        if leftovers:
+            errors.append(
+                "Registered watchdog state remains for PID(s): %s"
+                % ", ".join(str(item["pid"]) for item in leftovers)
+            )
+
+        if errors:
+            rumps.alert("Disarm did not complete", "\n\n".join(errors))
         else:
-            sh(["/bin/sh", "-c", kill_cmd])
-
-        # SIGKILL is immediate, but children may take a beat to reap. Verify.
-        for _ in range(12):
-            if not watchdog_pids():
-                break
-            time.sleep(0.25)
-
-        leftover = watchdog_pids()
-        if leftover:
-            # Fail loud — never leave the user thinking it disarmed when it
-            # didn't (e.g. the password prompt was cancelled).
-            rumps.alert(
-                "Disarm did not complete",
-                "The watchdog is still running (PID %s).\n\n"
-                "If you cancelled the password prompt, click Disarm again "
-                "and authenticate. To force-stop it from Terminal:\n\n"
-                "    sudo pkill -9 -f usb_watchdog.sh"
-                % ", ".join(str(p) for p in leftover))
-        else:
-            notify("USB Watchdog", "Disarmed", "Monitoring stopped.")
+            notify("USB Watchdog", "Disarmed", "Exact registered monitoring stopped.")
+            self._previously_healthy = False
+            self._fault_notified = False
         self.refresh(None)
 
     def on_quit(self, _):
-        if watchdog_pids():
-            r = rumps.alert(
+        if watchdog_instances():
+            result = rumps.alert(
                 "Quit the controller?",
-                "The watchdog keeps running in the background after you quit "
-                "this app (the menu-bar app is only a controller).\n\nDisarm "
-                "first if you want to stop monitoring.",
-                ok="Quit anyway", cancel="Cancel")
-            if r != 1:
+                "A registered watchdog remains active or needs attention after the "
+                "menu app quits. Disarm first if monitoring should stop.",
+                ok="Quit anyway",
+                cancel="Cancel",
+            )
+            if result != 1:
                 return
         rumps.quit_application()
 
-    # --- periodic UI refresh ---
     def refresh(self, _):
-        pids = watchdog_pids()
-        armed = bool(pids)
-        rooted = armed and any(pid_is_root(p) for p in pids)
-        dry = armed and not rooted
+        instances = watchdog_instances()
+        healthy = [item for item in instances if item["healthy"]]
+        unhealthy = [item for item in instances if not item["healthy"]]
 
-        if armed:
-            self.title = ICON_DRYRUN if dry else ICON_ARMED
-            self.status_item.title = ("● Armed%s — instant shutdown"
-                                      % (" (dry-run)" if dry else ""))
+        if healthy:
+            real = any(item["mode"] == "real" for item in healthy)
+            self.title = ICON_ARMED if real else ICON_DRYRUN
+            mode = "real" if real else "dry-run"
+            self.status_item.title = "● Armed (%s) — validated and healthy" % mode
             self.toggle_item.title = "Disarm"
             self._set_settings_enabled(False)
+            self._previously_healthy = True
+            self._fault_notified = False
+        elif unhealthy:
+            current = unhealthy[0]
+            self.title = ICON_FAULT
+            self.status_item.title = "● Attention required — %s" % current.get(
+                "status", "unhealthy"
+            )
+            self.toggle_item.title = "Disarm"
+            self._set_settings_enabled(False)
+            if self._previously_healthy and not self._fault_notified:
+                notify(
+                    "USB Watchdog",
+                    "Monitoring fault",
+                    "The registered watchdog is no longer reporting healthy monitoring.",
+                )
+                self._fault_notified = True
         else:
             self.title = ICON_DISARMED
             self.status_item.title = "● Disarmed"
             self.toggle_item.title = "Arm"
             self._set_settings_enabled(True)
+            if self._previously_healthy and not self._fault_notified:
+                notify(
+                    "USB Watchdog",
+                    "Monitoring stopped unexpectedly",
+                    "No registered watchdog instance remains.",
+                )
+                self._fault_notified = True
 
-        # Status above is a cheap ps read; the device submenu costs two
-        # system_profiler runs, so refresh it on a slower cadence (~16s).
         if self._tick % 4 == 0:
             self._update_devices()
         self._tick += 1
 
     def _set_settings_enabled(self, enabled):
-        # Dry-run choice is fixed while armed.
         self.dryrun_item.set_callback(self.on_toggle_dryrun if enabled else None)
+        self.wake_item.set_callback(self.on_toggle_wake if enabled else None)
 
     def _update_devices(self):
-        _, out, _ = sh(["/bin/bash", SCRIPT, "--snapshot"])
-        devs = [l for l in out.splitlines() if l.strip()]
-        self.devices_menu.title = "Devices (%d)" % len(devs)
+        rc, output, error = sh(["/bin/bash", SCRIPT, "--snapshot"], timeout=10)
         self.devices_menu.clear()
-        if devs:
-            for d in devs:
-                self.devices_menu.add(rumps.MenuItem(pretty_device(d)))
+        if rc != 0:
+            self.devices_menu.title = "Devices (unavailable)"
+            item = rumps.MenuItem("(hardware inventory unavailable: %s)" % (error.strip() or "probe failed"))
+            item.set_callback(None)
+            self.devices_menu.add(item)
+            return
+
+        devices = [line for line in output.splitlines() if line.strip()]
+        self.devices_menu.title = "Devices (%d)" % len(devices)
+        if devices:
+            for device in devices:
+                self.devices_menu.add(rumps.MenuItem(pretty_device(device)))
         else:
-            none_item = rumps.MenuItem("(no peripherals connected)")
-            none_item.set_callback(None)
-            self.devices_menu.add(none_item)
+            item = rumps.MenuItem("(no observed peripherals connected)")
+            item.set_callback(None)
+            self.devices_menu.add(item)
 
 
 if __name__ == "__main__":

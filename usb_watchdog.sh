@@ -635,14 +635,18 @@ monitor_loop() {
             }
         fi
         if [[ "$fast_current" != "$FAST_BASE" ]]; then
-            fast_current=$(read_snapshot_with_retries fast) || {
-                FAST_HEALTHY=false
-                runtime_probe_fault "USB/Thunderbolt confirmation" || true
-                last_cycle=$SECONDS
-                continue
-            }
-            if [[ "$fast_current" != "$FAST_BASE" ]]; then
-                if ! process_change "$FAST_BASE" "$fast_current"; then
+            # A successful difference is already a security event. In real
+            # mode process_change does not return after starting shutdown. A
+            # dry run returns, so confirm only to choose its next baseline;
+            # never let confirmation erase the event already observed.
+            if ! process_change "$FAST_BASE" "$fast_current"; then
+                fast_current=$(read_snapshot_with_retries fast) || {
+                    FAST_HEALTHY=false
+                    runtime_probe_fault "USB/Thunderbolt confirmation" || true
+                    last_cycle=$SECONDS
+                    continue
+                }
+                if [[ "$fast_current" != "$FAST_BASE" ]]; then
                     FAST_BASE="$fast_current"
                     echo "$(/bin/date '+%H:%M:%S') Dry-run baseline updated."
                 fi
@@ -663,14 +667,16 @@ monitor_loop() {
                 }
             fi
             if [[ "$slow_current" != "$SLOW_BASE" ]]; then
-                slow_current=$(read_snapshot_with_retries slow) || {
-                    SLOW_HEALTHY=false
-                    runtime_probe_fault "SD/display confirmation" || true
-                    last_cycle=$SECONDS
-                    continue
-                }
-                if [[ "$slow_current" != "$SLOW_BASE" ]]; then
-                    if ! process_change "$SLOW_BASE" "$slow_current"; then
+                # Match the fast path: enforce the first successful change,
+                # then use confirmation only for the dry-run baseline.
+                if ! process_change "$SLOW_BASE" "$slow_current"; then
+                    slow_current=$(read_snapshot_with_retries slow) || {
+                        SLOW_HEALTHY=false
+                        runtime_probe_fault "SD/display confirmation" || true
+                        last_cycle=$SECONDS
+                        continue
+                    }
+                    if [[ "$slow_current" != "$SLOW_BASE" ]]; then
                         SLOW_BASE="$slow_current"
                         echo "$(/bin/date '+%H:%M:%S') Dry-run baseline updated."
                     fi

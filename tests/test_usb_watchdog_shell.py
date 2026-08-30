@@ -175,6 +175,87 @@ class HealthStateTests(unittest.TestCase):
         self.assertIn("TZ=UTC LC_ALL=C /bin/ps -p $$ -o lstart=", shell_source)
 
 
+class RuntimeChangeTests(unittest.TestCase):
+    def run_monitor_cycle(
+        self,
+        *,
+        fast_initial="BASE",
+        slow_initial="BASE",
+        confirmation="BASE",
+        slow_cycles=99,
+        confirmation_fails=False,
+    ):
+        if confirmation_fails:
+            confirmation_body = "return 1"
+        else:
+            confirmation_body = "printf %s " + shlex.quote(confirmation)
+        body = (
+            "FAST_INTERVAL=0\n"
+            "WAKE_GAP_SECONDS=999999\n"
+            "PROBE_RETRIES=1\n"
+            f"SLOW_CYCLES={slow_cycles}\n"
+            "FAST_BASE=BASE\n"
+            "SLOW_BASE=BASE\n"
+            "stop_calls=0\n"
+            "stop_requested() {\n"
+            "  stop_calls=$((stop_calls + 1))\n"
+            "  (( stop_calls > 1 ))\n"
+            "}\n"
+            "write_heartbeat() { :; }\n"
+            "write_state() { :; }\n"
+            "get_fast_snapshot() { printf %s "
+            + shlex.quote(fast_initial)
+            + "; }\n"
+            "get_slow_snapshot() { printf %s "
+            + shlex.quote(slow_initial)
+            + "; }\n"
+            "snapshot_getter() { "
+            + confirmation_body
+            + "; }\n"
+            "process_change() {\n"
+            "  printf 'EVENT:%s->%s\\n' \"$1\" \"$2\"\n"
+            "  return 1\n"
+            "}\n"
+            "runtime_probe_fault() {\n"
+            "  printf 'FAULT:%s\\n' \"$1\"\n"
+            "  return 1\n"
+            "}\n"
+            "monitor_loop\n"
+            "printf 'FAST_BASE:%s\\n' \"$FAST_BASE\"\n"
+            "printf 'SLOW_BASE:%s\\n' \"$SLOW_BASE\""
+        )
+        return run_sourced(body, timeout=3)
+
+    def test_fast_change_is_enforced_before_reverting_confirmation(self):
+        result = self.run_monitor_cycle(fast_initial="CHANGED")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
+        self.assertIn("FAST_BASE:BASE", result.stdout)
+
+    def test_slow_change_is_enforced_before_reverting_confirmation(self):
+        result = self.run_monitor_cycle(slow_initial="CHANGED", slow_cycles=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
+        self.assertIn("SLOW_BASE:BASE", result.stdout)
+
+    def test_persistent_dry_run_change_updates_baseline_after_event(self):
+        result = self.run_monitor_cycle(
+            fast_initial="CHANGED", confirmation="CHANGED"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
+        self.assertIn("FAST_BASE:CHANGED", result.stdout)
+
+    def test_confirmation_failure_keeps_baseline_after_event(self):
+        result = self.run_monitor_cycle(
+            fast_initial="CHANGED", confirmation_fails=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
+        self.assertIn("FAULT:USB/Thunderbolt confirmation", result.stdout)
+        self.assertIn("FAST_BASE:BASE", result.stdout)
+
+
 class LiveSnapshotTests(unittest.TestCase):
     def test_snapshot_mode_returns_a_valid_result(self):
         result = subprocess.run(

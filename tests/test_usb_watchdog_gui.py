@@ -183,6 +183,10 @@ class StateTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_arm_timeout_covers_worst_case_bounded_baseline(self):
+        worst_case_probe_seconds = 4 * 2 * 4 * 3
+        self.assertGreater(gui.ARM_TIMEOUT_SECONDS, worst_case_probe_seconds)
+
     def test_shell_join_preserves_paths_with_spaces_and_quotes(self):
         command = ["/bin/bash", "/tmp/O'Brien Folder/script.sh", "plain"]
         joined = gui.shell_join(command)

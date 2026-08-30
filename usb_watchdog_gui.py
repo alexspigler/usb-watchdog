@@ -41,7 +41,10 @@ ICON_FAULT = "🟠"
 
 STATE_TOKEN_RE = re.compile(r"^[A-Fa-f0-9-]{16,64}$")
 HEARTBEAT_STALE_SECONDS = 12
-ARM_TIMEOUT_SECONDS = 30
+# Four attempts, two snapshots per attempt, and four independently bounded
+# probes across the fast and slow groups can take about 96 seconds in the
+# worst case. Leave margin for scheduling and state-file publication.
+ARM_TIMEOUT_SECONDS = 120
 PS_COMMAND = ["/usr/bin/env", "TZ=UTC", "LC_ALL=C", "/bin/ps"]
 
 

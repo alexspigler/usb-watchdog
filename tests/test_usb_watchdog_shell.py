@@ -22,6 +22,16 @@ def run_sourced(body, timeout=10):
 
 
 class ProbeContractTests(unittest.TestCase):
+    def test_removed_strict_wake_option_is_rejected(self):
+        result = subprocess.run(
+            ["/bin/bash", str(SCRIPT), "--wake-policy", "shutdown", "--snapshot"],
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown option", result.stderr)
+
     def test_successful_empty_fast_snapshot_is_valid(self):
         result = run_sourced(
             "get_usb_snapshot() { return 0; }\n"

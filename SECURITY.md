@@ -36,9 +36,10 @@ system and does not claim to prevent or contain a malicious device.
   or spoofed. Two same-model devices without distinct reported identifiers may
   be indistinguishable.
 - Changes can be missed if they happen and are reversed entirely between polls.
-- macOS suspends the process during sleep. Default wake comparison cannot prove
-  that nothing changed during sleep. Strict wake reduces that ambiguity by
-  shutting down after every detected resume.
+- macOS suspends the process during sleep. After wake, the engine compares a new
+  stable snapshot with its pre-sleep baseline and shuts down on a difference.
+  A device attached and removed entirely while the Mac remained asleep leaves no
+  final inventory difference to detect.
 - Detection occurs after macOS enumerates a device. It cannot guarantee that a
   malicious peripheral has not already interacted with the OS.
 - An administrator/root attacker, or an attacker able to modify the source/app
@@ -67,7 +68,7 @@ system and does not claim to prevent or contain a malicious device.
 
 Test every relevant device class in dry-run mode before arming real mode. Save
 work before testing, keep the menu app open for health alerts, and disarm before
-planned peripheral changes or sleep unless strict-wake shutdown is intended.
+planned peripheral changes.
 
 An unattended root LaunchDaemon is deliberately not included. A secure service
 would require a root-owned, non-user-writable installed engine, an explicit

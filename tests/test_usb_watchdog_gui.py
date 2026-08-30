@@ -49,7 +49,6 @@ class StateTests(unittest.TestCase):
             "mode": "dry-run",
             "status": "ready",
             "heartbeat": "1000",
-            "wake_policy": "compare",
             "detail": "monitoring",
         }
         values.update({key: str(value) for key, value in overrides.items()})
@@ -199,6 +198,11 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertIn("timed out", error)
         self.assertLess(elapsed, 1.0)
+
+    def test_strict_wake_control_is_not_present(self):
+        source = (ROOT / "usb_watchdog_gui.py").read_text(encoding="utf-8")
+        self.assertNotIn("strict_wake", source)
+        self.assertNotIn("--wake-policy", source)
 
 
 if __name__ == "__main__":

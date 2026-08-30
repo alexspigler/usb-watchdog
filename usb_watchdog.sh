@@ -20,8 +20,6 @@
 #  Options:
 #      --dry-run                 Report changes without shutting down.
 #      --snapshot                Print one validated device snapshot and exit.
-#      --wake-policy compare     Compare stable state after wake (default).
-#      --wake-policy shutdown    Shut down on every detected wake.
 #      --help                    Show this help.
 #
 #  Internal service options:
@@ -45,7 +43,6 @@ GRACEFUL_SHUTDOWN_SECONDS=5
 DRY_RUN=false
 SNAPSHOT_ONLY=false
 STOP_ONLY=false
-WAKE_POLICY="compare"
 STATE_FILE=""
 INSTANCE_TOKEN=""
 INSTANCE_STARTED=""
@@ -75,11 +72,6 @@ parse_args() {
                 SNAPSHOT_ONLY=true
                 shift
                 ;;
-            --wake-policy)
-                [[ $# -ge 2 ]] || fail "--wake-policy requires compare or shutdown"
-                WAKE_POLICY="$2"
-                shift 2
-                ;;
             --state-file)
                 [[ $# -ge 2 ]] || fail "--state-file requires an absolute path"
                 STATE_FILE="$2"
@@ -103,9 +95,6 @@ parse_args() {
                 ;;
         esac
     done
-
-    [[ "$WAKE_POLICY" == "compare" || "$WAKE_POLICY" == "shutdown" ]] ||
-        fail "--wake-policy must be compare or shutdown"
 
     if [[ -n "$STATE_FILE" ]]; then
         [[ "$STATE_FILE" == /* && "$STATE_FILE" != *$'\n'* ]] ||
@@ -421,7 +410,6 @@ write_state() {
             printf 'mode=%s\n' "$state_mode"
             printf 'status=%s\n' "$status"
             printf 'heartbeat=%s\n' "$now"
-            printf 'wake_policy=%s\n' "$WAKE_POLICY"
             printf 'detail=%s\n' "$detail"
         } > "$temp"
     )
@@ -604,11 +592,6 @@ monitor_loop() {
 
         if (( now - last_cycle > WAKE_GAP_SECONDS )); then
             write_state "settling" "system wake detected"
-            if [[ "$WAKE_POLICY" == "shutdown" ]]; then
-                if ! do_shutdown "SYSTEM RESUMED FROM SLEEP (strict wake policy)"; then
-                    :
-                fi
-            fi
             /bin/sleep "$WAKE_SETTLE_SECONDS"
             FAST_HEALTHY=false
             SLOW_HEALTHY=false
@@ -753,7 +736,7 @@ main() {
     echo ""
     echo "USB/TB poll:    approximately every ${FAST_INTERVAL}s"
     echo "SD/display:     approximately every $((SLOW_CYCLES)) fast cycles"
-    echo "Wake policy:    $WAKE_POLICY"
+    echo "After wake:     compare a new stable snapshot"
     echo "Dry run:        $DRY_RUN"
     echo ""
     echo "$(/bin/date '+%H:%M:%S') Ready. Monitoring validated snapshots."

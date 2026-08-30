@@ -236,7 +236,6 @@ class WatchdogApp(rumps.App):
     def __init__(self):
         super().__init__(ICON_DISARMED, quit_button=None)
         self.dry_run = False
-        self.strict_wake = False
         self._tick = 0
         self._previously_healthy = False
         self._fault_notified = False
@@ -247,9 +246,6 @@ class WatchdogApp(rumps.App):
         self.dryrun_item = rumps.MenuItem(
             "Dry-run (test, no shutdown)", callback=self.on_toggle_dryrun
         )
-        self.wake_item = rumps.MenuItem(
-            "Strict wake (shut down after sleep)", callback=self.on_toggle_wake
-        )
         self.devices_menu = rumps.MenuItem("Devices")
         self.devices_menu.add(rumps.MenuItem("(scanning…)"))
 
@@ -259,7 +255,6 @@ class WatchdogApp(rumps.App):
             self.toggle_item,
             None,
             self.dryrun_item,
-            self.wake_item,
             None,
             self.devices_menu,
             None,
@@ -274,10 +269,6 @@ class WatchdogApp(rumps.App):
         self.dry_run = not self.dry_run
         sender.state = 1 if self.dry_run else 0
 
-    def on_toggle_wake(self, sender):
-        self.strict_wake = not self.strict_wake
-        sender.state = 1 if self.strict_wake else 0
-
     def on_toggle(self, _):
         if watchdog_instances():
             self.disarm()
@@ -288,8 +279,6 @@ class WatchdogApp(rumps.App):
         arguments = [
             "/bin/bash",
             SCRIPT,
-            "--wake-policy",
-            "shutdown" if self.strict_wake else "compare",
             "--state-file",
             state_path,
             "--instance-token",
@@ -353,8 +342,7 @@ class WatchdogApp(rumps.App):
             notify(
                 "USB Watchdog",
                 "Armed",
-                "Validated baseline ready in %s mode; wake policy: %s."
-                % (mode_text, "shutdown" if self.strict_wake else "compare"),
+                "Validated baseline ready in %s mode." % mode_text,
             )
         else:
             detail = launch_error.strip()
@@ -478,7 +466,6 @@ class WatchdogApp(rumps.App):
 
     def _set_settings_enabled(self, enabled):
         self.dryrun_item.set_callback(self.on_toggle_dryrun if enabled else None)
-        self.wake_item.set_callback(self.on_toggle_wake if enabled else None)
 
     def _update_devices(self):
         rc, output, error = sh(["/bin/bash", SCRIPT, "--snapshot"], timeout=10)

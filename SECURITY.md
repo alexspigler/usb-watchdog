@@ -31,6 +31,10 @@ system and does not claim to prevent or contain a malicious device.
 - The shell engine accepts only the two documented shutdown-policy values. Both
   inventory changes and persistent probe failures reach the same policy-aware
   shutdown function.
+- Logs can contain observed device names and identifiers. The menu app creates
+  or repairs both log files as owner-readable only and refuses symlink or
+  non-file log targets. The root-readable state contains only a generic event
+  summary rather than the device-bearing shutdown reason.
 
 ## Explicit limitations
 

@@ -1,6 +1,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -218,6 +220,74 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertIn("timed out", error)
         self.assertLess(elapsed, 1.0)
+
+    def test_private_log_is_created_with_owner_only_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "watchdog.log"
+            with gui.open_private_log(log_path) as handle:
+                handle.write(b"first\n")
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "first\n")
+
+    def test_private_log_repairs_existing_permissions_and_appends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "watchdog.log"
+            log_path.write_text("existing\n", encoding="utf-8")
+            log_path.chmod(0o644)
+            with gui.open_private_log(log_path) as handle:
+                handle.write(b"new\n")
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+            self.assertEqual(
+                log_path.read_text(encoding="utf-8"), "existing\nnew\n"
+            )
+
+    def test_private_log_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.log"
+            target.write_text("do not change\n", encoding="utf-8")
+            link = Path(directory) / "watchdog.log"
+            link.symlink_to(target)
+            with self.assertRaises(OSError):
+                gui.open_private_log(link)
+            self.assertEqual(target.read_text(encoding="utf-8"), "do not change\n")
+
+    def test_privileged_launch_repairs_log_before_append(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "watchdog log.txt"
+            log_path.write_text("existing\n", encoding="utf-8")
+            log_path.chmod(0o644)
+            launch = gui.privileged_log_launch(
+                ["/bin/echo", "new entry"], str(log_path)
+            )
+            result = subprocess.run(
+                ["/bin/sh", "-c", launch],
+                text=True,
+                capture_output=True,
+                timeout=3,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            deadline = time.monotonic() + 1
+            while "new entry" not in log_path.read_text(encoding="utf-8"):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+
+    def test_privileged_launch_rejects_symlink_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.log"
+            target.write_text("do not change\n", encoding="utf-8")
+            link = Path(directory) / "watchdog.log"
+            link.symlink_to(target)
+            launch = gui.privileged_log_launch(["/bin/echo", "bad"], str(link))
+            result = subprocess.run(
+                ["/bin/sh", "-c", launch],
+                text=True,
+                capture_output=True,
+                timeout=3,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsafe watchdog log path", result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), "do not change\n")
 
     def test_strict_wake_control_is_not_present(self):
         source = (ROOT / "usb_watchdog_gui.py").read_text(encoding="utf-8")

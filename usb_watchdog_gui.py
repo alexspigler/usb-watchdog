@@ -76,6 +76,39 @@ def shell_join(command):
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
+def open_private_log(log_path):
+    """Open an append-only owner-readable log without following a symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(log_path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("watchdog log path is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "ab", buffering=0)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def privileged_log_launch(command, log_path):
+    """Build the fixed root launch command with a private, regular log file."""
+    quoted_log = shlex.quote(log_path)
+    unsafe_log_check = (
+        "if [ -L {0} ] || {{ [ -e {0} ] && [ ! -f {0} ]; }}; then "
+        "echo 'Refusing unsafe watchdog log path' >&2; exit 1; fi"
+    ).format(quoted_log)
+    return (
+        "umask 077; {check}; /usr/bin/touch {log} && /bin/chmod 600 {log} && "
+        "( {command} </dev/null >>{log} 2>&1 & )"
+    ).format(
+        check=unsafe_log_check,
+        command=shell_join(command),
+        log=quoted_log,
+    )
+
+
 def osascript_admin_shell(shell_command):
     """Run one already-quoted shell command behind the native admin prompt."""
     escaped = shell_command.replace("\\", "\\\\").replace('"', '\\"')
@@ -365,7 +398,7 @@ class WatchdogApp(rumps.App):
             os.makedirs(os.path.dirname(DRY_STATE), mode=0o700, exist_ok=True)
             os.makedirs(os.path.dirname(DRY_LOG), mode=0o700, exist_ok=True)
             try:
-                with open(log_path, "ab", buffering=0) as log_handle:
+                with open_private_log(log_path) as log_handle:
                     subprocess.Popen(
                         arguments,
                         stdin=subprocess.DEVNULL,
@@ -379,10 +412,7 @@ class WatchdogApp(rumps.App):
                 launched = False
                 launch_error = str(exc)
         else:
-            launch = "( %s </dev/null >>%s 2>&1 & )" % (
-                shell_join(arguments),
-                shlex.quote(log_path),
-            )
+            launch = privileged_log_launch(arguments, log_path)
             launched, launch_error = osascript_admin_shell(launch)
 
         armed = False

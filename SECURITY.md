@@ -28,6 +28,9 @@ system and does not claim to prevent or contain a malicious device.
   exits and cleans up its own state.
 - A future-dated or stale heartbeat is unhealthy. Process start identities are
   captured and compared in a stable UTC/C locale.
+- The shell engine accepts only the two documented shutdown-policy values. Both
+  inventory changes and persistent probe failures reach the same policy-aware
+  shutdown function.
 
 ## Explicit limitations
 
@@ -46,14 +49,16 @@ system and does not claim to prevent or contain a malicious device.
   before the user approves elevation, is outside the threat model.
 - The detached engine is not automatically supervised or restarted. The menu
   app can alert on a stale/missing heartbeat only while the menu app is running.
-- The graceful-shutdown fallback uses a quick halt and may cause data loss.
+- The default response attempts a graceful shutdown before using a forced quick
+  halt. The optional immediate response skips the graceful attempt. Either can
+  cause data loss.
 - Ad-hoc signing detects accidental post-build changes during local verification
   but supplies no publisher identity. The app is not notarized.
 
 ## Failure behavior
 
-- **Inventory change, real mode:** normal shutdown is requested immediately;
-  quick halt is the fallback after the configured grace period.
+- **Inventory change, real mode:** the selected response either requests normal
+  shutdown before the forced-halt fallback or begins forced halt immediately.
 - **Persistent probe failure, real mode:** treated as a security fault and the
   same shutdown path begins.
 - **Inventory change or probe failure, dry-run:** recorded and printed; no

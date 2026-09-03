@@ -20,6 +20,8 @@
 #  Options:
 #      --dry-run                 Report changes without shutting down.
 #      --snapshot                Print one validated device snapshot and exit.
+#      --shutdown-policy POLICY  graceful-then-force (default) or
+#                                force-immediately.
 #      --help                    Show this help.
 #
 #  Internal service options:
@@ -43,6 +45,7 @@ GRACEFUL_SHUTDOWN_SECONDS=5
 DRY_RUN=false
 SNAPSHOT_ONLY=false
 STOP_ONLY=false
+SHUTDOWN_POLICY="graceful-then-force"
 STATE_FILE=""
 INSTANCE_TOKEN=""
 INSTANCE_STARTED=""
@@ -71,6 +74,11 @@ parse_args() {
             --snapshot)
                 SNAPSHOT_ONLY=true
                 shift
+                ;;
+            --shutdown-policy)
+                [[ $# -ge 2 ]] || fail "--shutdown-policy requires a policy"
+                SHUTDOWN_POLICY="$2"
+                shift 2
                 ;;
             --state-file)
                 [[ $# -ge 2 ]] || fail "--state-file requires an absolute path"
@@ -109,6 +117,11 @@ parse_args() {
         [[ -n "$STATE_FILE" && -n "$INSTANCE_TOKEN" ]] ||
             fail "--stop requires --state-file and --instance-token"
     fi
+
+    case "$SHUTDOWN_POLICY" in
+        graceful-then-force|force-immediately) ;;
+        *) fail "--shutdown-policy must be graceful-then-force or force-immediately" ;;
+    esac
 }
 
 # macOS does not ship timeout(1). POSIX alarms survive exec, so the system Perl
@@ -408,6 +421,7 @@ write_state() {
             printf 'token=%s\n' "$INSTANCE_TOKEN"
             printf 'started=%s\n' "$INSTANCE_STARTED"
             printf 'mode=%s\n' "$state_mode"
+            printf 'shutdown_policy=%s\n' "$SHUTDOWN_POLICY"
             printf 'status=%s\n' "$status"
             printf 'heartbeat=%s\n' "$now"
             printf 'detail=%s\n' "$detail"
@@ -516,27 +530,48 @@ format_snapshot() {
     fi
 }
 
+request_graceful_shutdown() {
+    /sbin/shutdown -h now || true
+}
+
+request_forced_halt() {
+    /sbin/halt -q || true
+}
+
+wait_before_forced_halt() {
+    /bin/sleep "$GRACEFUL_SHUTDOWN_SECONDS"
+}
+
+force_halt_forever() {
+    while true; do
+        request_forced_halt
+        /bin/sleep 1
+    done
+}
+
 do_shutdown() {
-    local reason="$1"
-    write_state "shutting-down" "$reason" || true
+    local reason="$1" state_detail="${2:-shutdown required}"
+    write_state "shutting-down" "$state_detail" || true
 
     if [[ "$DRY_RUN" == true ]]; then
         echo ""
         echo "$(/bin/date '+%H:%M:%S') !!! DRY RUN — shutdown required !!!"
         echo "  Reason: $reason"
+        echo "  Policy: $SHUTDOWN_POLICY"
         return 1
     fi
 
     echo "!!! WATCHDOG TRIGGERED: $reason"
-    echo "!!! STARTING SHUTDOWN NOW !!!"
-    # Begin the normal, syncing shutdown immediately. If the system is still
-    # running after the grace period, fall back to an ungraceful quick halt.
-    /sbin/shutdown -h now || true
-    /bin/sleep "$GRACEFUL_SHUTDOWN_SECONDS"
-    while true; do
-        /sbin/halt -q || true
-        /bin/sleep 1
-    done
+    if [[ "$SHUTDOWN_POLICY" == "force-immediately" ]]; then
+        echo "!!! STARTING FORCED HALT NOW !!!"
+        force_halt_forever
+        return 0
+    fi
+
+    echo "!!! REQUESTING GRACEFUL SHUTDOWN NOW !!!"
+    request_graceful_shutdown
+    wait_before_forced_halt
+    force_halt_forever
 }
 
 process_change() {
@@ -554,7 +589,7 @@ process_change() {
         [[ -n "$reason" ]] && reason="$reason | "
         reason="${reason}ADDED: $(printf '%s\n' "$added" | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')"
     fi
-    do_shutdown "$reason"
+    do_shutdown "$reason" "hardware inventory change detected"
 }
 
 runtime_probe_fault() {
@@ -565,7 +600,9 @@ runtime_probe_fault() {
         /bin/sleep 1
         return 1
     fi
-    do_shutdown "PROBE FAULT: $probe_group inventory failed after bounded retries"
+    do_shutdown \
+        "PROBE FAULT: $probe_group inventory failed after bounded retries" \
+        "hardware inventory probe failure"
 }
 
 initialize_baselines() {
@@ -744,6 +781,7 @@ main() {
     echo "SD/display:     approximately every $((SLOW_CYCLES)) fast cycles"
     echo "After wake:     compare a new stable snapshot"
     echo "Dry run:        $DRY_RUN"
+    echo "Shutdown:       $SHUTDOWN_POLICY"
     echo ""
     echo "$(/bin/date '+%H:%M:%S') Ready. Monitoring validated snapshots."
 

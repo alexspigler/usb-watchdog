@@ -47,6 +47,7 @@ class StateTests(unittest.TestCase):
             "token": self.TOKEN,
             "started": "Sun Aug 30 18:20:31 2026",
             "mode": "dry-run",
+            "shutdown_policy": gui.GRACEFUL_THEN_FORCE,
             "status": "ready",
             "heartbeat": "1000",
             "detail": "monitoring",
@@ -162,6 +163,25 @@ class StateTests(unittest.TestCase):
             ["/known/root", "/known/dry"],
         )
 
+    def test_legacy_state_defaults_to_graceful_shutdown_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = self.write_state(directory)
+            lines = state_path.read_text(encoding="utf-8").splitlines()
+            state_path.write_text(
+                "\n".join(
+                    line for line in lines if not line.startswith("shutdown_policy=")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = gui._read_state_data(str(state_path))
+        self.assertEqual(state["shutdown_policy"], gui.GRACEFUL_THEN_FORCE)
+
+    def test_invalid_state_shutdown_policy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = self.write_state(directory, shutdown_policy="unknown")
+            self.assertIsNone(gui._read_state_data(str(state_path)))
+
     def test_process_start_identity_is_read_in_utc_c_locale(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = self.write_state(directory)
@@ -203,6 +223,38 @@ class CommandTests(unittest.TestCase):
         source = (ROOT / "usb_watchdog_gui.py").read_text(encoding="utf-8")
         self.assertNotIn("strict_wake", source)
         self.assertNotIn("--wake-policy", source)
+
+    def test_launch_arguments_include_selected_shutdown_policy(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.dry_run = True
+        app.shutdown_policy = gui.FORCE_IMMEDIATELY
+        arguments = app._launch_arguments("abc123", "/tmp/watchdog.state")
+        policy_index = arguments.index("--shutdown-policy")
+        self.assertEqual(arguments[policy_index + 1], gui.FORCE_IMMEDIATELY)
+        self.assertIn("--dry-run", arguments)
+
+    def test_gui_defaults_to_dry_run_and_recommended_policy(self):
+        self.assertTrue(gui.DEFAULT_DRY_RUN)
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.dry_run = gui.DEFAULT_DRY_RUN
+        app.shutdown_policy = gui.GRACEFUL_THEN_FORCE
+        arguments = app._launch_arguments("abc123", "/tmp/watchdog.state")
+        self.assertIn("--dry-run", arguments)
+        policy_index = arguments.index("--shutdown-policy")
+        self.assertEqual(arguments[policy_index + 1], gui.GRACEFUL_THEN_FORCE)
+
+    def test_real_mode_confirmation_names_selected_response(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.shutdown_policy = gui.FORCE_IMMEDIATELY
+        with mock.patch.object(gui.rumps, "alert", return_value=1) as alert:
+            self.assertTrue(app._confirm_real_mode())
+        self.assertIn("ungraceful forced halt", alert.call_args.args[1])
+
+    def test_real_mode_confirmation_can_cancel(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.shutdown_policy = gui.GRACEFUL_THEN_FORCE
+        with mock.patch.object(gui.rumps, "alert", return_value=0):
+            self.assertFalse(app._confirm_real_mode())
 
 
 if __name__ == "__main__":

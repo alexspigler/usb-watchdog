@@ -79,6 +79,47 @@ class ProbeContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertLess(elapsed, 2.5)
 
+    def test_shutdown_policy_defaults_to_graceful_then_force(self):
+        result = run_sourced("parse_args\nprintf %s \"$SHUTDOWN_POLICY\"")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "graceful-then-force")
+
+    def test_both_shutdown_policies_are_accepted(self):
+        for policy in ("graceful-then-force", "force-immediately"):
+            with self.subTest(policy=policy):
+                result = run_sourced(
+                    "parse_args --shutdown-policy %s\nprintf %%s \"$SHUTDOWN_POLICY\""
+                    % shlex.quote(policy)
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, policy)
+
+    def test_invalid_shutdown_policy_is_rejected(self):
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                str(SCRIPT),
+                "--shutdown-policy",
+                "power-off-maybe",
+                "--snapshot",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--shutdown-policy must be", result.stderr)
+
+    def test_missing_shutdown_policy_value_is_rejected(self):
+        result = subprocess.run(
+            ["/bin/bash", str(SCRIPT), "--shutdown-policy"],
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a policy", result.stderr)
+
 
 class ParserTests(unittest.TestCase):
     def test_usb_without_serial_has_explicit_empty_serial_field(self):
@@ -254,6 +295,49 @@ class RuntimeChangeTests(unittest.TestCase):
         self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
         self.assertIn("FAULT:USB/Thunderbolt confirmation", result.stdout)
         self.assertIn("FAST_BASE:BASE", result.stdout)
+
+
+class ShutdownPolicyTests(unittest.TestCase):
+    def run_shutdown(self, policy, dry_run=False):
+        return run_sourced(
+            "SHUTDOWN_POLICY=%s\n"
+            "DRY_RUN=%s\n"
+            "write_state() { printf 'STATE:%%s:%%s\\n' \"$1\" \"$2\"; }\n"
+            "request_graceful_shutdown() { echo GRACEFUL; }\n"
+            "wait_before_forced_halt() { echo WAIT; }\n"
+            "force_halt_forever() { echo FORCED; }\n"
+            "do_shutdown 'REMOVED: serial=private' 'hardware inventory change detected'"
+            % (shlex.quote(policy), "true" if dry_run else "false")
+        )
+
+    def test_graceful_policy_requests_normal_shutdown_before_forced_halt(self):
+        result = self.run_shutdown("graceful-then-force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(result.stdout.index("GRACEFUL"), result.stdout.index("FORCED"))
+
+    def test_immediate_policy_skips_graceful_shutdown(self):
+        result = self.run_shutdown("force-immediately")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("GRACEFUL", result.stdout)
+        self.assertIn("FORCED", result.stdout)
+
+    def test_dry_run_calls_neither_shutdown_path(self):
+        for policy in ("graceful-then-force", "force-immediately"):
+            with self.subTest(policy=policy):
+                result = self.run_shutdown(policy, dry_run=True)
+                self.assertNotIn("GRACEFUL", result.stdout)
+                self.assertNotIn("FORCED", result.stdout)
+                self.assertIn("Policy: %s" % policy, result.stdout)
+
+    def test_state_detail_excludes_device_identifiers(self):
+        result = self.run_shutdown("force-immediately")
+        state_line = next(
+            line for line in result.stdout.splitlines() if line.startswith("STATE:")
+        )
+        self.assertEqual(
+            state_line, "STATE:shutting-down:hardware inventory change detected"
+        )
+        self.assertNotIn("serial=private", state_line)
 
 
 class LiveSnapshotTests(unittest.TestCase):

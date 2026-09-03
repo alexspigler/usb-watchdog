@@ -26,14 +26,14 @@ Then either double-click `USB Watchdog.command`, or build and open the local app
 open "dist/USB Watchdog.app"
 ```
 
-Start with **Dry-run** selected. Arm the watchdog, add or remove each kind of
+Dry-run is selected by default. Arm the watchdog, add or remove each kind of
 device you care about, and confirm the change is reported without a shutdown.
 
-Real mode asks for an administrator password each time it is armed. A healthy
-green status means a complete, stable baseline was established and both probe
-groups are still succeeding. Orange means the registered process is stale,
-faulted, or no longer reporting a current heartbeat; PID presence alone is not
-treated as healthy.
+Real mode requests administrator authorization when it is armed and requires a
+separate confirmation in the menu app. A healthy green status means a complete,
+stable baseline was established and both probe groups are still succeeding.
+Orange means the registered process is stale, faulted, or no longer reporting a
+current heartbeat; PID presence alone is not treated as healthy.
 
 ## Behavior
 
@@ -48,9 +48,11 @@ treated as healthy.
 - After wake, the engine waits briefly for hardware to settle and compares a new
   stable snapshot with the pre-sleep baseline. A remaining difference initiates
   shutdown.
-- Shutdown first requests the normal syncing macOS shutdown. If the machine is
-  still running after 5 seconds, the engine repeatedly requests a quick halt,
-  which can lose unsaved data.
+- The recommended shutdown response first requests the normal syncing macOS
+  shutdown. If the machine is still running after 5 seconds, the engine
+  repeatedly requests a forced quick halt.
+- An optional immediate forced-halt response skips the normal shutdown request.
+  Both responses can lose unsaved data; the immediate response is riskier.
 
 The menu app starts a detached instance, but there is no automatic restart
 service. If the engine exits, the open menu app reports the stale/missing
@@ -78,6 +80,12 @@ Run for real in the foreground:
 
 ```sh
 sudo ./usb_watchdog.sh
+```
+
+Select an immediate forced halt instead of the default graceful attempt:
+
+```sh
+sudo ./usb_watchdog.sh --shutdown-policy force-immediately
 ```
 
 ## Development

@@ -46,6 +46,10 @@ HEARTBEAT_STALE_SECONDS = 12
 # worst case. Leave margin for scheduling and state-file publication.
 ARM_TIMEOUT_SECONDS = 120
 PS_COMMAND = ["/usr/bin/env", "TZ=UTC", "LC_ALL=C", "/bin/ps"]
+GRACEFUL_THEN_FORCE = "graceful-then-force"
+FORCE_IMMEDIATELY = "force-immediately"
+SHUTDOWN_POLICIES = {GRACEFUL_THEN_FORCE, FORCE_IMMEDIATELY}
+DEFAULT_DRY_RUN = True
 
 
 def sh(command, timeout=10):
@@ -123,6 +127,7 @@ def _read_state_data(state_path):
     started = data.get("started", "").strip()
     mode = data.get("mode", "")
     status = data.get("status", "unknown")
+    shutdown_policy = data.get("shutdown_policy", GRACEFUL_THEN_FORCE)
     if (
         data.get("version") != "1"
         or pid <= 1
@@ -132,6 +137,8 @@ def _read_state_data(state_path):
     ):
         return None
     if mode not in {"real", "dry-run"}:
+        return None
+    if shutdown_policy not in SHUTDOWN_POLICIES:
         return None
 
     data.update(
@@ -144,6 +151,7 @@ def _read_state_data(state_path):
             "started": started,
             "mode": mode,
             "status": status,
+            "shutdown_policy": shutdown_policy,
         }
     )
     return data
@@ -235,7 +243,8 @@ def notify(title, subtitle, message):
 class WatchdogApp(rumps.App):
     def __init__(self):
         super().__init__(ICON_DISARMED, quit_button=None)
-        self.dry_run = False
+        self.dry_run = DEFAULT_DRY_RUN
+        self.shutdown_policy = GRACEFUL_THEN_FORCE
         self._tick = 0
         self._previously_healthy = False
         self._fault_notified = False
@@ -246,6 +255,19 @@ class WatchdogApp(rumps.App):
         self.dryrun_item = rumps.MenuItem(
             "Dry-run (test, no shutdown)", callback=self.on_toggle_dryrun
         )
+        self.dryrun_item.state = 1 if self.dry_run else 0
+        self.shutdown_menu = rumps.MenuItem("Shutdown response")
+        self.graceful_shutdown_item = rumps.MenuItem(
+            "Graceful shutdown, then forced halt (recommended)",
+            callback=self.on_select_graceful_shutdown,
+        )
+        self.immediate_halt_item = rumps.MenuItem(
+            "Immediate forced halt (unsafe)",
+            callback=self.on_select_immediate_halt,
+        )
+        self.shutdown_menu.add(self.graceful_shutdown_item)
+        self.shutdown_menu.add(self.immediate_halt_item)
+        self._update_shutdown_menu()
         self.devices_menu = rumps.MenuItem("Devices")
         self.devices_menu.add(rumps.MenuItem("(scanning…)"))
 
@@ -255,6 +277,7 @@ class WatchdogApp(rumps.App):
             self.toggle_item,
             None,
             self.dryrun_item,
+            self.shutdown_menu,
             None,
             self.devices_menu,
             None,
@@ -268,6 +291,39 @@ class WatchdogApp(rumps.App):
     def on_toggle_dryrun(self, sender):
         self.dry_run = not self.dry_run
         sender.state = 1 if self.dry_run else 0
+
+    def on_select_graceful_shutdown(self, _):
+        self.shutdown_policy = GRACEFUL_THEN_FORCE
+        self._update_shutdown_menu()
+
+    def on_select_immediate_halt(self, _):
+        self.shutdown_policy = FORCE_IMMEDIATELY
+        self._update_shutdown_menu()
+
+    def _update_shutdown_menu(self):
+        self.graceful_shutdown_item.state = (
+            1 if self.shutdown_policy == GRACEFUL_THEN_FORCE else 0
+        )
+        self.immediate_halt_item.state = (
+            1 if self.shutdown_policy == FORCE_IMMEDIATELY else 0
+        )
+
+    def _confirm_real_mode(self):
+        if self.shutdown_policy == FORCE_IMMEDIATELY:
+            response = "immediately request an ungraceful forced halt"
+        else:
+            response = (
+                "request a normal shutdown, then force a halt after "
+                "the five-second grace period"
+            )
+        result = rumps.alert(
+            "Arm real shutdown mode?",
+            "A successfully observed inventory change or persistent probe failure "
+            "will %s. Unsaved work can be lost." % response,
+            ok="Arm real mode",
+            cancel="Cancel",
+        )
+        return result == 1
 
     def on_toggle(self, _):
         if watchdog_instances():
@@ -283,6 +339,8 @@ class WatchdogApp(rumps.App):
             state_path,
             "--instance-token",
             token,
+            "--shutdown-policy",
+            self.shutdown_policy,
         ]
         if self.dry_run:
             arguments.append("--dry-run")
@@ -291,6 +349,11 @@ class WatchdogApp(rumps.App):
     def arm(self):
         if not os.path.isfile(SCRIPT):
             rumps.alert("Cannot find usb_watchdog.sh", "Expected at:\n" + SCRIPT)
+            return
+        if self.shutdown_policy not in SHUTDOWN_POLICIES:
+            rumps.alert("Cannot arm", "The selected shutdown response is invalid.")
+            return
+        if not self.dry_run and not self._confirm_real_mode():
             return
 
         token = secrets.token_hex(16)
@@ -423,6 +486,11 @@ class WatchdogApp(rumps.App):
         healthy = [item for item in instances if item["healthy"]]
         unhealthy = [item for item in instances if not item["healthy"]]
 
+        if instances:
+            registered = healthy[0] if healthy else unhealthy[0]
+            self.shutdown_policy = registered["shutdown_policy"]
+            self._update_shutdown_menu()
+
         if healthy:
             real = any(item["mode"] == "real" for item in healthy)
             self.title = ICON_ARMED if real else ICON_DRYRUN
@@ -466,6 +534,12 @@ class WatchdogApp(rumps.App):
 
     def _set_settings_enabled(self, enabled):
         self.dryrun_item.set_callback(self.on_toggle_dryrun if enabled else None)
+        self.graceful_shutdown_item.set_callback(
+            self.on_select_graceful_shutdown if enabled else None
+        )
+        self.immediate_halt_item.set_callback(
+            self.on_select_immediate_halt if enabled else None
+        )
 
     def _update_devices(self):
         rc, output, error = sh(["/bin/bash", SCRIPT, "--snapshot"], timeout=10)

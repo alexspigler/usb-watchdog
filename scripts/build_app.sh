@@ -5,6 +5,8 @@ PROJECT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON="$PROJECT_DIR/.venv/bin/python"
 APP="$PROJECT_DIR/dist/USB Watchdog.app"
 BUNDLED_ENGINE="$APP/Contents/Resources/usb_watchdog.sh"
+EVENT_MONITOR="$PROJECT_DIR/build/usb_watchdog_event_monitor"
+BUNDLED_EVENT_MONITOR="$APP/Contents/Resources/usb_watchdog_event_monitor"
 
 [[ "$PROJECT_DIR" != "/" && -f "$PROJECT_DIR/setup.py" ]] || {
     echo "Error: refusing to build outside the USB Watchdog project." >&2
@@ -27,11 +29,14 @@ BUNDLED_ENGINE="$APP/Contents/Resources/usb_watchdog.sh"
     cd "$PROJECT_DIR"
     "$PYTHON" setup.py py2app
 )
+"$PROJECT_DIR/scripts/build_event_monitor.sh"
 
 [[ -d "$APP" && -f "$BUNDLED_ENGINE" ]] || {
     echo "Error: py2app did not produce the expected app bundle." >&2
     exit 1
 }
+/bin/cp "$EVENT_MONITOR" "$BUNDLED_EVENT_MONITOR"
+/bin/chmod 0755 "$BUNDLED_EVENT_MONITOR"
 
 # Finder/file-provider attributes make strict code-signature validation fail.
 /usr/bin/xattr -cr "$APP"
@@ -39,6 +44,8 @@ BUNDLED_ENGINE="$APP/Contents/Resources/usb_watchdog.sh"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
 /usr/bin/plutil -lint "$APP/Contents/Info.plist"
 /usr/bin/cmp "$PROJECT_DIR/usb_watchdog.sh" "$BUNDLED_ENGINE"
+/usr/bin/cmp "$EVENT_MONITOR" "$BUNDLED_EVENT_MONITOR"
+/usr/bin/file "$BUNDLED_EVENT_MONITOR" | /usr/bin/grep -q 'Mach-O.*executable'
 
 echo "Built and verified: $APP"
 echo "Signature: ad-hoc local only (not Developer ID signed or notarized)."

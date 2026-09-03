@@ -41,10 +41,11 @@ ICON_FAULT = "🟠"
 
 STATE_TOKEN_RE = re.compile(r"^[A-Fa-f0-9-]{16,64}$")
 HEARTBEAT_STALE_SECONDS = 12
-# Four attempts, two snapshots per attempt, and four independently bounded
-# probes across the fast and slow groups can take about 96 seconds in the
-# worst case. Leave margin for scheduling and state-file publication.
-ARM_TIMEOUT_SECONDS = 120
+# Startup collects stable fast and slow baselines, then repeats the fast baseline
+# after the event listener starts. With four attempts, two snapshots per attempt,
+# and 3-second probe bounds, that can take about 144 seconds. Leave margin for
+# retry sleeps, helper startup, scheduling, and state-file publication.
+ARM_TIMEOUT_SECONDS = 180
 PS_COMMAND = ["/usr/bin/env", "TZ=UTC", "LC_ALL=C", "/bin/ps"]
 GRACEFUL_THEN_FORCE = "graceful-then-force"
 FORCE_IMMEDIATELY = "force-immediately"
@@ -230,11 +231,12 @@ def read_instance(state_path, now=None):
         now = int(time.time())
     state["alive"] = _process_matches_state(state)
     state["age"] = now - state["heartbeat"]
+    state["current"] = state["alive"] and 0 <= state["age"] <= HEARTBEAT_STALE_SECONDS
     state["healthy"] = (
-        state["alive"]
-        and state["status"] == "ready"
-        and 0 <= state["age"] <= HEARTBEAT_STALE_SECONDS
+        state["current"] and state["status"] == "ready"
     )
+    state["polling"] = state["current"] and state["status"] == "polling"
+    state["operational"] = state["healthy"] or state["polling"]
     return state
 
 
@@ -250,7 +252,8 @@ def watchdog_instances():
 
 def pretty_device(line):
     if line.startswith("USB:"):
-        match = re.match(r"USB:port=(\S+) (\S+) sn=(\S*) (.+)", line)
+        visible = line.split(" | profile=", 1)[0]
+        match = re.match(r"USB:port=(\S+) (\S+) sn=(\S*) (.+)", visible)
         if match:
             location, _vendor_product, serial, name = match.groups()
             serial_tag = " · #%s" % serial if serial else ""
@@ -377,6 +380,8 @@ class WatchdogApp(rumps.App):
         ]
         if self.dry_run:
             arguments.append("--dry-run")
+        else:
+            arguments.extend(["--event-monitor-uid", str(os.getuid())])
         return arguments
 
     def arm(self):
@@ -424,7 +429,7 @@ class WatchdogApp(rumps.App):
                 if (
                     last_state
                     and last_state["token"] == token
-                    and last_state["healthy"]
+                    and last_state["operational"]
                 ):
                     armed = True
                     break
@@ -432,11 +437,19 @@ class WatchdogApp(rumps.App):
 
         if armed:
             mode_text = "dry-run" if self.dry_run else "real"
-            notify(
-                "USB Watchdog",
-                "Armed",
-                "Validated baseline ready in %s mode." % mode_text,
-            )
+            if last_state["polling"]:
+                notify(
+                    "USB Watchdog",
+                    "Armed with polling fallback",
+                    "The native USB event monitor is unavailable; validated polling remains active in %s mode."
+                    % mode_text,
+                )
+            else:
+                notify(
+                    "USB Watchdog",
+                    "Armed",
+                    "Validated baseline ready in %s mode." % mode_text,
+                )
         else:
             detail = launch_error.strip()
             if last_state:
@@ -514,10 +527,13 @@ class WatchdogApp(rumps.App):
     def refresh(self, _):
         instances = watchdog_instances()
         healthy = [item for item in instances if item["healthy"]]
-        unhealthy = [item for item in instances if not item["healthy"]]
+        polling = [item for item in instances if item["polling"]]
+        unhealthy = [item for item in instances if not item["operational"]]
 
         if instances:
-            registered = healthy[0] if healthy else unhealthy[0]
+            registered = (
+                healthy[0] if healthy else (polling[0] if polling else unhealthy[0])
+            )
             self.shutdown_policy = registered["shutdown_policy"]
             self._update_shutdown_menu()
 
@@ -530,6 +546,20 @@ class WatchdogApp(rumps.App):
             self._set_settings_enabled(False)
             self._previously_healthy = True
             self._fault_notified = False
+        elif polling:
+            current = polling[0]
+            self.title = ICON_FAULT
+            self.status_item.title = "● Armed (%s) — polling fallback" % current["mode"]
+            self.toggle_item.title = "Disarm"
+            self._set_settings_enabled(False)
+            if self._previously_healthy and not self._fault_notified:
+                notify(
+                    "USB Watchdog",
+                    "Event monitor unavailable",
+                    "USB monitoring is continuing with the validated polling fallback.",
+                )
+                self._fault_notified = True
+            self._previously_healthy = False
         elif unhealthy:
             current = unhealthy[0]
             self.title = ICON_FAULT

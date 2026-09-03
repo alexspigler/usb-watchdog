@@ -32,7 +32,7 @@ jobs:
         run: |
           .venv/bin/python -m unittest discover -s tests -v
           /bin/bash -n usb_watchdog.sh
-          shellcheck usb_watchdog.sh
+          shellcheck usb_watchdog.sh scripts/build_app.sh scripts/build_event_monitor.sh
 
       - name: Build and verify app bundle
         run: ./scripts/build_app.sh

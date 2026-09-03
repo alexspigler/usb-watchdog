@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import select
 import shlex
 import subprocess
 import tempfile
@@ -135,6 +136,152 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("USB:port=1048576 1234:5678 sn= Keyboard", result.stdout)
+        self.assertIn(
+            "profile=usb=?;rev=?;device=?/?/?;packet=?;configs=?;interfaces=none",
+            result.stdout,
+        )
+
+    def test_usb_profile_includes_static_device_and_interface_descriptors(self):
+        fixture = r'''
++-o Composite Device@00100000  <class IOUSBHostDevice, id 1>
+  "idVendor" = 1234
+  "idProduct" = 5678
+  "locationID" = 1048576
+  "bcdUSB" = 512
+  "bcdDevice" = 257
+  "bDeviceClass" = 0
+  "bDeviceSubClass" = 0
+  "bDeviceProtocol" = 0
+  "bMaxPacketSize0" = 64
+  "bNumConfigurations" = 1
+  "kUSBSerialNumberString" = "SERIAL1"
+  "kUSBProductString" = "Composite Device"
+  +-o Storage Interface  <class IOUSBHostInterface, id 2>
+    "bConfigurationValue" = 1
+    "bInterfaceNumber" = 1
+    "bInterfaceClass" = 8
+    "bInterfaceSubClass" = 6
+    "bInterfaceProtocol" = 80
+    "bNumEndpoints" = 2
+  +-o Keyboard Interface  <class IOUSBHostInterface, id 3>
+    "bConfigurationValue" = 1
+    "bInterfaceNumber" = 0
+    "bInterfaceClass" = 3
+    "bInterfaceSubClass" = 1
+    "bInterfaceProtocol" = 1
+    "bNumEndpoints" = 1
+'''
+        result = run_sourced(
+            "printf %s " + shlex.quote(fixture) + " | parse_usb_snapshot"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "USB:port=1048576 1234:5678 sn=SERIAL1 Composite Device | "
+            "profile=usb=512;rev=257;device=0/0/0;packet=64;configs=1;"
+            "interfaces=0:3/1/1,1:8/6/80",
+        )
+
+    def test_interface_order_does_not_change_the_usb_fingerprint(self):
+        header = r'''
++-o Composite Device@00100000  <class IOUSBHostDevice, id 1>
+  "idVendor" = 1234
+  "idProduct" = 5678
+  "locationID" = 1048576
+  "USB Product Name" = "Composite Device"
+'''
+        keyboard = r'''
+  +-o Keyboard Interface  <class IOUSBHostInterface, id 2>
+    "bConfigurationValue" = 1
+    "bInterfaceNumber" = 0
+    "bInterfaceClass" = 3
+    "bInterfaceSubClass" = 1
+    "bInterfaceProtocol" = 1
+    "bNumEndpoints" = 1
+'''
+        storage = r'''
+  +-o Storage Interface  <class IOUSBHostInterface, id 3>
+    "bConfigurationValue" = 1
+    "bInterfaceNumber" = 1
+    "bInterfaceClass" = 8
+    "bInterfaceSubClass" = 6
+    "bInterfaceProtocol" = 80
+    "bNumEndpoints" = 2
+'''
+        first = run_sourced(
+            "printf %s "
+            + shlex.quote(header + keyboard + storage)
+            + " | parse_usb_snapshot"
+        )
+        second = run_sourced(
+            "printf %s "
+            + shlex.quote(header + storage + keyboard)
+            + " | parse_usb_snapshot"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+
+    def test_new_interface_changes_fingerprint_even_when_device_ids_match(self):
+        base = r'''
++-o Composite Device@00100000  <class IOUSBHostDevice, id 1>
+  "idVendor" = 1234
+  "idProduct" = 5678
+  "locationID" = 1048576
+  "USB Serial Number" = "SERIAL1"
+  "USB Product Name" = "Composite Device"
+  +-o Storage Interface  <class IOUSBHostInterface, id 2>
+    "bConfigurationValue" = 1
+    "bInterfaceNumber" = 0
+    "bInterfaceClass" = 8
+    "bInterfaceSubClass" = 6
+    "bInterfaceProtocol" = 80
+    "bNumEndpoints" = 2
+'''
+        keyboard = r'''
+  +-o Keyboard Interface  <class IOUSBHostInterface, id 3>
+    "bConfigurationValue" = 1
+    "bInterfaceNumber" = 1
+    "bInterfaceClass" = 3
+    "bInterfaceSubClass" = 1
+    "bInterfaceProtocol" = 1
+    "bNumEndpoints" = 1
+'''
+        base_result = run_sourced(
+            "printf %s " + shlex.quote(base) + " | parse_usb_snapshot"
+        )
+        changed_result = run_sourced(
+            "printf %s " + shlex.quote(base + keyboard) + " | parse_usb_snapshot"
+        )
+        self.assertEqual(base_result.returncode, 0, base_result.stderr)
+        self.assertEqual(changed_result.returncode, 0, changed_result.stderr)
+        self.assertNotEqual(base_result.stdout, changed_result.stdout)
+        self.assertIn("1:3/1/1", changed_result.stdout)
+
+    def test_active_configuration_and_endpoint_count_are_not_fingerprinted(self):
+        template = r'''
++-o Audio Device@00100000  <class IOUSBHostDevice, id 1>
+  "idVendor" = 1234
+  "idProduct" = 5678
+  "locationID" = 1048576
+  "USB Product Name" = "Audio Device"
+  +-o Audio Interface  <class IOUSBHostInterface, id 2>
+    "bConfigurationValue" = %s
+    "bInterfaceNumber" = 1
+    "bInterfaceClass" = 1
+    "bInterfaceSubClass" = 2
+    "bInterfaceProtocol" = 0
+    "bNumEndpoints" = %s
+'''
+        first = run_sourced(
+            "printf %s " + shlex.quote(template % (1, 0)) + " | parse_usb_snapshot"
+        )
+        second = run_sourced(
+            "printf %s " + shlex.quote(template % (2, 3)) + " | parse_usb_snapshot"
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
 
     def test_external_display_serial_is_included(self):
         fixture = """        Studio Display:\n          Display Serial Number: ABC123\n"""
@@ -328,6 +475,213 @@ class RuntimeChangeTests(unittest.TestCase):
         self.assertIn("FAULT:USB/Thunderbolt confirmation", result.stdout)
         self.assertIn("FAST_BASE:BASE", result.stdout)
 
+
+class NativeEventMonitorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.binary = Path(cls.directory.name) / "usb_watchdog_event_monitor"
+        result = subprocess.run(
+            [
+                "/usr/bin/clang",
+                "-std=c11",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-framework",
+                "CoreFoundation",
+                "-framework",
+                "IOKit",
+                str(ROOT / "usb_watchdog_events.c"),
+                "-o",
+                str(cls.binary),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise AssertionError(result.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def test_invalid_mode_is_rejected(self):
+        result = subprocess.run(
+            [str(self.binary), "--snapshot"],
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--events", result.stderr)
+
+    def test_listener_registers_and_reports_heartbeats(self):
+        process = subprocess.Popen(
+            [str(self.binary), "--events"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            readable, _, _ = select.select([process.stdout], [], [], 3)
+            self.assertTrue(readable, "event monitor did not report readiness")
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            readable, _, _ = select.select([process.stdout], [], [], 3)
+            self.assertTrue(readable, "event monitor heartbeat was not received")
+            self.assertEqual(process.stdout.readline().strip(), "heartbeat")
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_listener_watches_device_and_interface_services(self):
+        source = (ROOT / "usb_watchdog_events.c").read_text(encoding="utf-8")
+        self.assertIn('"IOUSBHostDevice"', source)
+        self.assertIn('"IOUSBHostInterface"', source)
+
+
+class EventFallbackTests(unittest.TestCase):
+    def test_partial_helper_line_cannot_block_polling_fallback(self):
+        started = time.monotonic()
+        result = run_sourced(
+            "exec 9< <(exec /usr/bin/perl -e '$|=1; print \"partial-message\"; sleep 30')\n"
+            "helper_pid=$!\n"
+            "set +e\n"
+            "read_event_with_timeout 0.1\n"
+            "status=$?\n"
+            "exec 9<&-\n"
+            "/bin/kill \"$helper_pid\" 2>/dev/null || true\n"
+            "wait \"$helper_pid\" 2>/dev/null || true\n"
+            "printf %s \"$status\"",
+            timeout=2,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "2")
+        self.assertLess(elapsed, 1.0)
+
+    def test_helper_that_ignores_term_is_force_stopped_within_bound(self):
+        started = time.monotonic()
+        result = run_sourced(
+            "exec 8< <(exec /usr/bin/perl -e '$SIG{TERM}=sub {}; $|=1; print \"ready\\n\"; while (1) { sleep 30 }')\n"
+            "helper_pid=$!\n"
+            "IFS= read -r -u 8 ready\n"
+            "[[ \"$ready\" == ready ]]\n"
+            "EVENT_MONITOR_PID=$helper_pid\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "stop_usb_event_monitor\n"
+            "exec 8<&-\n"
+            "printf stopped",
+            timeout=2,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "stopped")
+        self.assertLess(elapsed, 1.5)
+
+    def test_event_hint_wakes_without_waiting_for_poll_timeout(self):
+        started = time.monotonic()
+        result = run_sourced(
+            "FAST_INTERVAL=1\n"
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_LAST_HEARTBEAT=$SECONDS\n"
+            "read_event_with_timeout() { printf usb-published; }\n"
+            "wait_for_fast_check\n"
+            "printf %s \"$EVENT_MONITOR_HEALTHY\""
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "true")
+        self.assertLess(elapsed, 0.5)
+
+    def test_helper_timeout_keeps_polling_path_healthy(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=$$\n"
+            "EVENT_LAST_HEARTBEAT=$SECONDS\n"
+            "read_event_with_timeout() { return 1; }\n"
+            "wait_for_fast_check\n"
+            "printf '%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "true:true")
+
+    def test_helper_eof_degrades_to_polling(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "FAST_HEALTHY=true\n"
+            "SLOW_HEALTHY=true\n"
+            "read_event_with_timeout() { return 2; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:polling:", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
+
+    def test_invalid_helper_message_degrades_to_polling(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "FAST_HEALTHY=true\n"
+            "SLOW_HEALTHY=true\n"
+            "read_event_with_timeout() { printf unexpected-message; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:polling:", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
+
+    def test_helper_loss_cannot_mask_existing_probe_fault(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "FAST_HEALTHY=false\n"
+            "SLOW_HEALTHY=true\n"
+            "read_event_with_timeout() { return 2; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:fault:", result.stdout)
+        self.assertNotIn("STATE:polling:", result.stdout)
+
+    def test_stale_helper_heartbeat_degrades_even_when_pipe_stays_open(self):
+        result = run_sourced(
+            "/bin/sleep 10 &\n"
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=$!\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "FAST_HEALTHY=true\n"
+            "SLOW_HEALTHY=true\n"
+            "EVENT_LAST_HEARTBEAT=0\n"
+            "EVENT_HEARTBEAT_TIMEOUT_SECONDS=0\n"
+            "SECONDS=2\n"
+            "read_event_with_timeout() { return 1; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:polling:", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
 
 class ShutdownPolicyTests(unittest.TestCase):
     def run_shutdown(self, policy, dry_run=False):

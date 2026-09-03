@@ -2,16 +2,17 @@
 py2app build script for the USB Watchdog menu bar app.
 
 Build a standalone .app:
-    .venv/bin/python setup.py py2app
+    ./scripts/build_app.sh
 
 The result lands in dist/USB Watchdog.app — self-contained (bundles its own
-Python + rumps) and dock-less (LSUIElement), living only in the menu bar.
+Python, rumps, and the native event listener) and dock-less (LSUIElement),
+living only in the menu bar.
 """
 from setuptools import setup
 
 APP = ["usb_watchdog_gui.py"]
 DATA_FILES = ["usb_watchdog.sh"]
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 OPTIONS = {
     "argv_emulation": False,
     "packages": ["rumps"],

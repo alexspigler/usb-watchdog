@@ -3,11 +3,11 @@
 #  usb_watchdog.sh — USB/Thunderbolt/SD/display change monitor for macOS
 # ========================================================================
 #
-#  The monitor records observable hardware inventory fields and begins an
-#  immediate OS shutdown when those fields change. It is a tamper alarm, not
-#  cryptographic device authentication: cloned descriptors, changes completed
-#  entirely between polls, and changes made and restored while the Mac sleeps
-#  cannot be distinguished from an unchanged device set.
+#  The monitor records observable hardware inventory fields and starts the
+#  selected shutdown response when those fields change. It is a tamper alarm,
+#  not cryptographic device authentication: cloned descriptors and changes made
+#  and restored while the Mac sleeps can be indistinguishable from an unchanged
+#  device set.
 #
 #  Normal use:
 #      ./usb_watchdog.sh --dry-run
@@ -27,12 +27,15 @@
 #  Internal service options:
 #      --state-file PATH
 #      --instance-token TOKEN
+#      --event-monitor-uid UID
 #      --stop
 #
 # ========================================================================
 
-# Polling and failure-policy configuration. The slow cadence is approximately
-# 3 seconds: 0.25 seconds * 12 cycles, plus actual probe time.
+# Polling and failure-policy configuration. USB events request an immediate
+# inventory check when the native helper is available. The timed loop remains a
+# fallback. The slow cadence includes 12 waits, 12 fast probes, and a slow probe.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 FAST_INTERVAL=0.25
 SLOW_CYCLES=12
 PROBE_TIMEOUT_SECONDS=3
@@ -41,6 +44,8 @@ STABLE_ATTEMPTS=4
 WAKE_GAP_SECONDS=2
 WAKE_SETTLE_SECONDS=2
 GRACEFUL_SHUTDOWN_SECONDS=5
+EVENT_START_TIMEOUT_SECONDS=2
+EVENT_HEARTBEAT_TIMEOUT_SECONDS=3
 
 DRY_RUN=false
 SNAPSHOT_ONLY=false
@@ -54,6 +59,13 @@ STATE_LOCKED=false
 LAST_HEARTBEAT=0
 FAST_HEALTHY=false
 SLOW_HEALTHY=false
+EVENT_MONITOR_ACTIVE=false
+EVENT_MONITOR_HEALTHY=false
+EVENT_MONITOR_PID=""
+EVENT_MONITOR_FD=9
+EVENT_MONITOR_FD_OPEN=false
+EVENT_LAST_HEARTBEAT=0
+EVENT_MONITOR_UID=""
 
 usage() {
     /usr/bin/awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
@@ -90,6 +102,11 @@ parse_args() {
                 INSTANCE_TOKEN="$2"
                 shift 2
                 ;;
+            --event-monitor-uid)
+                [[ $# -ge 2 ]] || fail "--event-monitor-uid requires a UID"
+                EVENT_MONITOR_UID="$2"
+                shift 2
+                ;;
             --stop)
                 STOP_ONLY=true
                 shift
@@ -113,6 +130,13 @@ parse_args() {
         fail "--instance-token requires --state-file"
     fi
 
+    if [[ -n "$EVENT_MONITOR_UID" ]]; then
+        [[ "$EVENT_MONITOR_UID" =~ ^[0-9]+$ && "$EVENT_MONITOR_UID" -gt 0 ]] ||
+            fail "--event-monitor-uid must be a positive numeric UID"
+        [[ $EUID -eq 0 ]] ||
+            fail "--event-monitor-uid is only valid for a root monitor"
+    fi
+
     if [[ "$STOP_ONLY" == true ]]; then
         [[ -n "$STATE_FILE" && -n "$INSTANCE_TOKEN" ]] ||
             fail "--stop requires --state-file and --instance-token"
@@ -134,30 +158,250 @@ run_with_timeout() {
         "$seconds" "$@"
 }
 
-parse_usb_snapshot() {
-    /usr/bin/awk '
-        function flush() {
-            if (name != "" && vid != "") {
-                pn = (prod != "" ? prod : name)
-                print "USB:port=" loc " " vid ":" pid " sn=" sn " " pn
+event_monitor_path() {
+    local candidate
+    for candidate in \
+        "$SCRIPT_DIR/usb_watchdog_event_monitor" \
+        "$SCRIPT_DIR/build/usb_watchdog_event_monitor"; do
+        if [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+stop_usb_event_monitor() {
+    local pid="$EVENT_MONITOR_PID" attempt
+    if [[ "$EVENT_MONITOR_FD_OPEN" == true ]]; then
+        exec 9<&-
+        EVENT_MONITOR_FD_OPEN=false
+    fi
+    if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]]; then
+        /bin/kill "$pid" 2>/dev/null || true
+        attempt=0
+        while /bin/kill -0 "$pid" 2>/dev/null && (( attempt < 10 )); do
+            /bin/sleep 0.05
+            attempt=$((attempt + 1))
+        done
+        if /bin/kill -0 "$pid" 2>/dev/null; then
+            /bin/kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+    fi
+    EVENT_MONITOR_ACTIVE=false
+    EVENT_MONITOR_PID=""
+}
+
+start_usb_event_monitor() {
+    local helper ready_message
+    helper=$(event_monitor_path) || return 1
+
+    if [[ $EUID -eq 0 ]]; then
+        if [[ -z "$EVENT_MONITOR_UID" && "${SUDO_UID:-}" =~ ^[0-9]+$ &&
+              "${SUDO_UID:-0}" -gt 0 ]]; then
+            EVENT_MONITOR_UID="$SUDO_UID"
+        fi
+        [[ "$EVENT_MONITOR_UID" =~ ^[0-9]+$ && "$EVENT_MONITOR_UID" -gt 0 ]] ||
+            return 1
+        # sudo drops credentials before execve opens the mutable helper path,
+        # so replacing the helper cannot turn it into root code execution.
+        exec 9< <(/usr/bin/sudo -n -u "#$EVENT_MONITOR_UID" -- "$helper" --events)
+    else
+        exec 9< <("$helper" --events)
+    fi
+    EVENT_MONITOR_PID=$!
+    EVENT_MONITOR_FD_OPEN=true
+    if IFS= read -r -t "$EVENT_START_TIMEOUT_SECONDS" \
+        -u "$EVENT_MONITOR_FD" ready_message && [[ "$ready_message" == "ready" ]]; then
+        EVENT_MONITOR_ACTIVE=true
+        EVENT_MONITOR_HEALTHY=true
+        EVENT_LAST_HEARTBEAT=$SECONDS
+        return 0
+    fi
+
+    stop_usb_event_monitor
+    return 1
+}
+
+mark_event_monitor_unavailable() {
+    stop_usb_event_monitor
+    EVENT_MONITOR_HEALTHY=false
+    echo "$(/bin/date '+%H:%M:%S') USB event monitor unavailable; polling fallback remains active."
+    if [[ "$FAST_HEALTHY" == true && "$SLOW_HEALTHY" == true ]]; then
+        write_state "polling" "USB event monitor unavailable; polling fallback active" || true
+    else
+        write_state "fault" "event monitor unavailable and an inventory probe is unhealthy" || true
+    fi
+}
+
+read_event_with_timeout() {
+    local timeout="$1"
+    /usr/bin/perl -e '
+        use strict;
+        use warnings;
+        use Time::HiRes qw(time);
+        my ($fd, $timeout) = @ARGV;
+        open(my $stream, "<&=$fd") or exit 2;
+        my $deadline = time() + $timeout;
+        my $line = "";
+        while (length($line) <= 64) {
+            my $remaining = $deadline - time();
+            exit(length($line) == 0 ? 1 : 2) if $remaining <= 0;
+            my $readable = "";
+            vec($readable, fileno($stream), 1) = 1;
+            my $ready = select($readable, undef, undef, $remaining);
+            exit 3 unless defined $ready;
+            exit(length($line) == 0 ? 1 : 2) if $ready == 0;
+            my $count = sysread($stream, my $byte, 1);
+            exit 2 unless defined($count) && $count == 1;
+            $line .= $byte;
+            if ($byte eq "\n") {
+                print $line;
+                exit 0;
             }
         }
+        exit 2;
+    ' "$EVENT_MONITOR_FD" "$timeout"
+}
+
+wait_for_fast_check() {
+    local message read_status
+    if [[ "$EVENT_MONITOR_ACTIVE" != true ]]; then
+        /bin/sleep "$FAST_INTERVAL"
+        return 0
+    fi
+
+    if message=$(read_event_with_timeout "$FAST_INTERVAL"); then
+        case "$message" in
+            usb-published|usb-terminated)
+                EVENT_LAST_HEARTBEAT=$SECONDS
+                return 0
+                ;;
+            heartbeat)
+                EVENT_LAST_HEARTBEAT=$SECONDS
+                return 0
+                ;;
+            *)
+                mark_event_monitor_unavailable
+                return 0
+                ;;
+        esac
+    else
+        read_status=$?
+    fi
+
+    if (( read_status != 1 )) ||
+        ! /bin/kill -0 "$EVENT_MONITOR_PID" 2>/dev/null ||
+        (( SECONDS - EVENT_LAST_HEARTBEAT > EVENT_HEARTBEAT_TIMEOUT_SECONDS )); then
+        mark_event_monitor_unavailable
+    fi
+}
+
+parse_usb_snapshot() {
+    /usr/bin/awk '
+        function observed(value) {
+            return (value != "" ? value : "?")
+        }
+        function property_value(line, key, value) {
+            value = line
+            sub(".*\\\"" key "\\\" = ", "", value)
+            gsub(/\"/, "", value)
+            return value
+        }
+        function flush_interface(tuple) {
+            if (!in_interface) return
+            tuple = observed(inumber) ":" \
+                observed(iclass) "/" observed(isubclass) "/" observed(iprotocol)
+            interface_count++
+            interface_values[interface_count] = tuple
+            in_interface = 0
+            inumber=""; iclass=""; isubclass=""; iprotocol=""
+        }
+        function sorted_interfaces(    i, j, temporary, result) {
+            for (i = 1; i <= interface_count; i++) {
+                for (j = i + 1; j <= interface_count; j++) {
+                    if (interface_values[j] < interface_values[i]) {
+                        temporary = interface_values[i]
+                        interface_values[i] = interface_values[j]
+                        interface_values[j] = temporary
+                    }
+                }
+            }
+            result = ""
+            for (i = 1; i <= interface_count; i++) {
+                result = result (result != "" ? "," : "") interface_values[i]
+            }
+            return result
+        }
+        function clear_interfaces(    i) {
+            for (i = 1; i <= interface_count; i++) delete interface_values[i]
+            interface_count = 0
+        }
+        function flush(interfaces, profile) {
+            flush_interface()
+            if (in_device && name != "" && vid != "") {
+                pn = (prod != "" ? prod : name)
+                interfaces = sorted_interfaces()
+                profile = "usb=" observed(usb_version) ";rev=" observed(revision) \
+                    ";device=" observed(dclass) "/" observed(dsubclass) "/" observed(dprotocol) \
+                    ";packet=" observed(max_packet) ";configs=" observed(configs) \
+                    ";interfaces=" (interfaces != "" ? interfaces : "none")
+                print "USB:port=" observed(loc) " " observed(vid) ":" observed(pid) \
+                    " sn=" sn " " pn " | profile=" profile
+            }
+            in_device=0; in_interface=0; device_depth=0
+            name=""; vid=""; pid=""; loc=""; sn=""; prod=""
+            usb_version=""; revision=""; dclass=""; dsubclass=""; dprotocol=""
+            max_packet=""; configs=""; interfaces=""
+            clear_interfaces()
+        }
         /\+-o / {
-            flush()
-            name = $0
-            sub(/.*\+-o /, "", name); sub(/@.*/, "", name); sub(/  <class.*/, "", name)
-            gsub(/^[ \t]+|[ \t]+$/, "", name)
-            vid=""; pid=""; loc=""; sn=""; prod=""
+            depth = index($0, "+-o ")
+            if ($0 ~ /<class [^,>]*USBHostDevice/) {
+                flush()
+                in_device=1; device_depth=depth
+                name = $0
+                sub(/.*\+-o /, "", name); sub(/@.*/, "", name); sub(/  <class.*/, "", name)
+                gsub(/^[ \t]+|[ \t]+$/, "", name)
+            } else if (in_device && depth > device_depth &&
+                       $0 ~ /<class [^,>]*USBHostInterface/) {
+                flush_interface()
+                in_interface=1
+            } else {
+                flush_interface()
+                if (in_device && depth <= device_depth) flush()
+            }
+            next
         }
-        /"idVendor" = /  { vid = $NF }
-        /"idProduct" = / { pid = $NF }
-        /"locationID" = / { loc = $NF }
-        /"USB Serial Number" = / {
-            sn = $0; sub(/.*"USB Serial Number" = /, "", sn); gsub(/"/, "", sn)
+        in_device && !in_interface && /"idVendor" = /  { vid = $NF }
+        in_device && !in_interface && /"idProduct" = / { pid = $NF }
+        in_device && !in_interface && /"locationID" = / { loc = $NF }
+        in_device && !in_interface && /"bcdUSB" = / { usb_version = $NF }
+        in_device && !in_interface && /"bcdDevice" = / { revision = $NF }
+        in_device && !in_interface && /"bDeviceClass" = / { dclass = $NF }
+        in_device && !in_interface && /"bDeviceSubClass" = / { dsubclass = $NF }
+        in_device && !in_interface && /"bDeviceProtocol" = / { dprotocol = $NF }
+        in_device && !in_interface && /"bMaxPacketSize0" = / { max_packet = $NF }
+        in_device && !in_interface && /"bNumConfigurations" = / { configs = $NF }
+        in_device && !in_interface && /"(USB Serial Number|kUSBSerialNumberString)" = / {
+            if ($0 ~ /"USB Serial Number" = /) {
+                sn = property_value($0, "USB Serial Number")
+            } else {
+                sn = property_value($0, "kUSBSerialNumberString")
+            }
         }
-        /"USB Product Name" = / {
-            prod = $0; sub(/.*"USB Product Name" = /, "", prod); gsub(/"/, "", prod)
+        in_device && !in_interface && /"(USB Product Name|kUSBProductString)" = / {
+            if ($0 ~ /"USB Product Name" = /) {
+                prod = property_value($0, "USB Product Name")
+            } else {
+                prod = property_value($0, "kUSBProductString")
+            }
         }
+        in_interface && /"bInterfaceNumber" = / { inumber = $NF }
+        in_interface && /"bInterfaceClass" = / { iclass = $NF }
+        in_interface && /"bInterfaceSubClass" = / { isubclass = $NF }
+        in_interface && /"bInterfaceProtocol" = / { iprotocol = $NF }
         END { flush() }
     '
 }
@@ -432,13 +676,21 @@ write_state() {
     LAST_HEARTBEAT="$now"
 }
 
+write_monitoring_state() {
+    if [[ "$EVENT_MONITOR_HEALTHY" == true ]]; then
+        write_state "ready" "event-triggered USB checks with polling fallback"
+    else
+        write_state "polling" "USB event monitor unavailable; polling fallback active"
+    fi
+}
+
 write_heartbeat() {
     local now
     [[ -n "$STATE_FILE" ]] || return 0
     now=$(/bin/date +%s)
     if [[ "$now" != "$LAST_HEARTBEAT" ]]; then
         if [[ "$FAST_HEALTHY" == true && "$SLOW_HEALTHY" == true ]]; then
-            write_state "ready" "monitoring"
+            write_monitoring_state
         else
             write_state "fault" "one or more probe groups await recovery"
         fi
@@ -623,7 +875,7 @@ monitor_loop() {
     last_cycle=$SECONDS
 
     while true; do
-        /bin/sleep "$FAST_INTERVAL"
+        wait_for_fast_check
         stop_requested && return 0
         now=$SECONDS
 
@@ -656,7 +908,7 @@ monitor_loop() {
                     SLOW_BASE="$slow_current"
                 fi
             fi
-            write_state "ready" "monitoring after wake"
+            write_monitoring_state
             cycle=0
             last_cycle=$SECONDS
             continue
@@ -728,7 +980,7 @@ monitor_loop() {
 }
 
 main() {
-    local combined count
+    local combined count fast_current
     set -euo pipefail
     parse_args "$@"
 
@@ -757,7 +1009,7 @@ main() {
     fi
 
     prepare_state
-    trap remove_owned_state EXIT
+    trap 'stop_usb_event_monitor; remove_owned_state' EXIT
     trap signal_exit SIGINT SIGTERM
 
     if ! initialize_baselines; then
@@ -765,6 +1017,24 @@ main() {
         write_state "fault" "could not establish a complete stable baseline" || true
         echo "Error: could not establish a complete stable hardware baseline." >&2
         exit 2
+    fi
+
+    if ! start_usb_event_monitor; then
+        echo "$(/bin/date '+%H:%M:%S') Native USB event monitor unavailable; using polling only."
+    fi
+
+    # Close the short handoff between the stable baseline and event-listener
+    # registration. A persistent change in that window is enforced before the
+    # engine reports ready; later helper events remain queued for the loop.
+    fast_current=$(collect_stable_snapshot fast) || {
+        write_state "fault" "could not reconcile USB event monitor startup" || true
+        echo "Error: could not reconcile the USB event monitor with the baseline." >&2
+        exit 2
+    }
+    if [[ "$fast_current" != "$FAST_BASE" ]]; then
+        if ! process_change "$FAST_BASE" "$fast_current"; then
+            FAST_BASE="$fast_current"
+        fi
     fi
 
     combined=$(merge_snapshots "$FAST_BASE" "$SLOW_BASE")
@@ -777,15 +1047,20 @@ main() {
     echo "Validated baseline devices ($count):"
     format_snapshot "$combined"
     echo ""
-    echo "USB/TB poll:    approximately every ${FAST_INTERVAL}s"
-    echo "SD/display:     approximately every $((SLOW_CYCLES)) fast cycles"
+    if [[ "$EVENT_MONITOR_HEALTHY" == true ]]; then
+        echo "USB events:     native event-triggered checks active"
+    else
+        echo "USB events:     unavailable; polling fallback active"
+    fi
+    echo "USB/TB fallback: every ${FAST_INTERVAL}s plus probe time"
+    echo "SD/display:     every $((SLOW_CYCLES)) fast cycles plus probe time"
     echo "After wake:     compare a new stable snapshot"
     echo "Dry run:        $DRY_RUN"
     echo "Shutdown:       $SHUTDOWN_POLICY"
     echo ""
     echo "$(/bin/date '+%H:%M:%S') Ready. Monitoring validated snapshots."
 
-    write_state "ready" "monitoring"
+    write_monitoring_state
     monitor_loop
 }
 

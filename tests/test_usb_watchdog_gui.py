@@ -121,6 +121,47 @@ class StateTests(unittest.TestCase):
                 )
         self.assertTrue(state["alive"])
         self.assertFalse(state["healthy"])
+        self.assertFalse(state["operational"])
+
+    def test_current_polling_state_remains_operational(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = self.write_state(directory, status="polling")
+            process = (
+                f"{os.getuid()} /bin/bash /tmp/usb_watchdog.sh "
+                f"--instance-token {self.TOKEN} --dry-run\n"
+            )
+            with mock.patch.object(
+                gui,
+                "sh",
+                side_effect=[
+                    (0, process, ""),
+                    (0, "Sun Aug 30 18:20:31 2026\n", ""),
+                ],
+            ):
+                state = gui.read_instance(str(state_path), now=1005)
+        self.assertTrue(state["alive"])
+        self.assertFalse(state["healthy"])
+        self.assertTrue(state["polling"])
+        self.assertTrue(state["operational"])
+
+    def test_probe_degraded_state_is_not_treated_as_polling_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = self.write_state(directory, status="degraded")
+            process = (
+                f"{os.getuid()} /bin/bash /tmp/usb_watchdog.sh "
+                f"--instance-token {self.TOKEN} --dry-run\n"
+            )
+            with mock.patch.object(
+                gui,
+                "sh",
+                side_effect=[
+                    (0, process, ""),
+                    (0, "Sun Aug 30 18:20:31 2026\n", ""),
+                ],
+            ):
+                state = gui.read_instance(str(state_path), now=1005)
+        self.assertFalse(state["polling"])
+        self.assertFalse(state["operational"])
 
     def test_future_heartbeat_after_clock_rollback_is_not_healthy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,8 +245,29 @@ class StateTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_pretty_usb_device_hides_internal_descriptor_profile(self):
+        line = (
+            "USB:port=1048576 1234:5678 sn=SERIAL1 Composite Device | "
+            "profile=usb=512;rev=257;device=0/0/0;packet=64;configs=1;"
+            "interfaces=0:3/1/1"
+        )
+        self.assertEqual(
+            gui.pretty_device(line),
+            "USB · Composite Device (port 1048576) · #SERIAL1",
+        )
+
     def test_arm_timeout_covers_worst_case_bounded_baseline(self):
-        worst_case_probe_seconds = 4 * 2 * 4 * 3
+        baseline_probes = 4
+        startup_reconciliation_probes = 2
+        snapshots_per_attempt = 2
+        attempts = 4
+        probe_timeout_seconds = 3
+        worst_case_probe_seconds = (
+            (baseline_probes + startup_reconciliation_probes)
+            * snapshots_per_attempt
+            * attempts
+            * probe_timeout_seconds
+        )
         self.assertGreater(gui.ARM_TIMEOUT_SECONDS, worst_case_probe_seconds)
 
     def test_shell_join_preserves_paths_with_spaces_and_quotes(self):
@@ -302,6 +364,14 @@ class CommandTests(unittest.TestCase):
         policy_index = arguments.index("--shutdown-policy")
         self.assertEqual(arguments[policy_index + 1], gui.FORCE_IMMEDIATELY)
         self.assertIn("--dry-run", arguments)
+
+    def test_real_launch_drops_event_monitor_to_requesting_user(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.dry_run = False
+        app.shutdown_policy = gui.GRACEFUL_THEN_FORCE
+        arguments = app._launch_arguments("abc123", "/tmp/watchdog.state")
+        uid_index = arguments.index("--event-monitor-uid")
+        self.assertEqual(arguments[uid_index + 1], str(os.getuid()))
 
     def test_gui_defaults_to_dry_run_and_recommended_policy(self):
         self.assertTrue(gui.DEFAULT_DRY_RUN)

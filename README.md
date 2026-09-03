@@ -19,6 +19,12 @@ BadUSB demonstrated how modified device firmware can abuse that trust to inject
 commands, redirect traffic, or install malware while still appearing to be an
 ordinary accessory.
 
+The same tripwire can detect ordinary peripheral tampering: removing or
+substituting a trusted device, adding an unexpected USB or Thunderbolt hub or
+dock, or inserting USB or SD storage while the Mac is unattended. In real mode,
+it also initiates shutdown if it persistently loses the ability to collect a
+complete hardware inventory.
+
 USB Watchdog takes a simple, aggressive approach: it records the expected
 peripheral inventory and starts the selected shutdown response when that
 inventory changes. It does not inspect firmware or block USB enumeration. It is

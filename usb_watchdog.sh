@@ -266,7 +266,7 @@ read_event_with_timeout() {
 }
 
 wait_for_fast_check() {
-    local message read_status
+    local cycle_started="${1:-$SECONDS}" message read_status
     if [[ "$EVENT_MONITOR_ACTIVE" != true ]]; then
         /bin/sleep "$FAST_INTERVAL"
         return 0
@@ -292,8 +292,20 @@ wait_for_fast_check() {
     fi
 
     if (( read_status != 1 )) ||
-        ! /bin/kill -0 "$EVENT_MONITOR_PID" 2>/dev/null ||
-        (( SECONDS - EVENT_LAST_HEARTBEAT > EVENT_HEARTBEAT_TIMEOUT_SECONDS )); then
+        ! /bin/kill -0 "$EVENT_MONITOR_PID" 2>/dev/null; then
+        mark_event_monitor_unavailable
+        return 0
+    fi
+
+    # Both processes pause during sleep. A clean timeout from a still-running
+    # helper is therefore a wake signal, not proof that its heartbeat failed.
+    # Give the resumed helper one normal heartbeat window to report again.
+    if (( SECONDS - cycle_started > WAKE_GAP_SECONDS )); then
+        EVENT_LAST_HEARTBEAT=$SECONDS
+        return 0
+    fi
+
+    if (( SECONDS - EVENT_LAST_HEARTBEAT > EVENT_HEARTBEAT_TIMEOUT_SECONDS )); then
         mark_event_monitor_unavailable
     fi
 }
@@ -875,7 +887,7 @@ monitor_loop() {
     last_cycle=$SECONDS
 
     while true; do
-        wait_for_fast_check
+        wait_for_fast_check "$last_cycle"
         stop_requested && return 0
         now=$SECONDS
 

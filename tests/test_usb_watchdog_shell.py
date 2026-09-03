@@ -683,6 +683,108 @@ class EventFallbackTests(unittest.TestCase):
         self.assertIn("STATE:polling:", result.stdout)
         self.assertIn("MODE:false:false", result.stdout)
 
+    def test_wake_gap_keeps_live_event_monitor_healthy(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=$$\n"
+            "EVENT_LAST_HEARTBEAT=0\n"
+            "EVENT_HEARTBEAT_TIMEOUT_SECONDS=3\n"
+            "WAKE_GAP_SECONDS=2\n"
+            "SECONDS=10\n"
+            "read_event_with_timeout() { return 1; }\n"
+            "wait_for_fast_check 0\n"
+            "printf 'MODE:%s:%s AGE:%s' "
+            '"$EVENT_MONITOR_ACTIVE" "$EVENT_MONITOR_HEALTHY" '
+            '"$((SECONDS - EVENT_LAST_HEARTBEAT))"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MODE:true:true AGE:0", result.stdout)
+        self.assertNotIn("polling fallback", result.stdout)
+
+    def test_post_wake_heartbeat_keeps_event_monitor_healthy(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=$$\n"
+            "EVENT_LAST_HEARTBEAT=0\n"
+            "EVENT_HEARTBEAT_TIMEOUT_SECONDS=3\n"
+            "WAKE_GAP_SECONDS=2\n"
+            "SECONDS=10\n"
+            "read_event_with_timeout() { return 1; }\n"
+            "wait_for_fast_check 0\n"
+            "read_event_with_timeout() { printf heartbeat; }\n"
+            "wait_for_fast_check \"$SECONDS\"\n"
+            "printf 'MODE:%s:%s AGE:%s' "
+            '"$EVENT_MONITOR_ACTIVE" "$EVENT_MONITOR_HEALTHY" '
+            '"$((SECONDS - EVENT_LAST_HEARTBEAT))"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MODE:true:true AGE:0", result.stdout)
+
+    def test_post_wake_heartbeat_grace_is_bounded(self):
+        result = run_sourced(
+            "/bin/sleep 10 &\n"
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=$!\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "EVENT_LAST_HEARTBEAT=0\n"
+            "EVENT_HEARTBEAT_TIMEOUT_SECONDS=3\n"
+            "WAKE_GAP_SECONDS=2\n"
+            "FAST_HEALTHY=true\n"
+            "SLOW_HEALTHY=true\n"
+            "SECONDS=10\n"
+            "read_event_with_timeout() { return 1; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check 0\n"
+            "SECONDS=$((EVENT_LAST_HEARTBEAT + EVENT_HEARTBEAT_TIMEOUT_SECONDS + 1))\n"
+            "wait_for_fast_check \"$SECONDS\"\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:polling:", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
+
+    def test_wake_gap_does_not_hide_dead_event_monitor(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=99999999\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "FAST_HEALTHY=true\n"
+            "SLOW_HEALTHY=true\n"
+            "WAKE_GAP_SECONDS=2\n"
+            "SECONDS=10\n"
+            "read_event_with_timeout() { return 1; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check 0\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:polling:", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
+
+    def test_wake_gap_does_not_hide_malformed_event_output(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=$$\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "FAST_HEALTHY=true\n"
+            "SLOW_HEALTHY=true\n"
+            "WAKE_GAP_SECONDS=2\n"
+            "SECONDS=10\n"
+            "read_event_with_timeout() { printf unexpected-message; }\n"
+            "stop_usb_event_monitor() { EVENT_MONITOR_ACTIVE=false; EVENT_MONITOR_PID=; }\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "wait_for_fast_check 0\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:polling:", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
+
 class ShutdownPolicyTests(unittest.TestCase):
     def run_shutdown(self, policy, dry_run=False):
         return run_sourced(

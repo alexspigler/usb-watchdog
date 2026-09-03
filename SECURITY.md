@@ -18,6 +18,14 @@ system and does not claim to prevent or contain a malicious device.
 - A baseline is accepted only after all four probes succeed and both fast and
   slow inventory groups return the same result twice.
 - Probe errors and timeouts are distinct from a successful empty inventory.
+- The native IOKit listener supplies scheduling hints only. Every notification
+  still passes through the shell engine's bounded inventory probe, baseline
+  comparison, and existing shutdown-policy path.
+- In real mode, the root shell launches the separate, mutable listener at the
+  requesting user's UID. Replacing that helper cannot create a new path to root
+  code execution; false or missing hints cannot disable independent polling.
+- The listener emits a heartbeat. Exit, malformed output, or a missing heartbeat
+  degrades visibly to the independently timed polling fallback.
 - The menu app reports Armed only when the exact registered PID, UID, launch
   token, process start identity, ready state, and recent heartbeat all match.
 - State files must be regular, correctly owned, non-group-writable, and
@@ -38,17 +46,23 @@ system and does not claim to prevent or contain a malicious device.
 
 ## Explicit limitations
 
-- USB location, vendor/product IDs, serial strings, Thunderbolt UIDs, display
-  serials, and names are device- or OS-reported observations. They can be absent
-  or spoofed. Two same-model devices without distinct reported identifiers may
-  be indistinguishable.
-- Changes can be missed if they happen and are reversed entirely between polls.
+- USB location, vendor/product IDs, serial and product strings, revision values,
+  device class, configuration count, maximum control-packet size, and published
+  interface profiles are device- or OS-reported observations. They can be absent
+  or spoofed. A device that reproduces the complete observed profile may remain
+  indistinguishable.
+- IOKit device and interface notifications reduce the ordinary delay before a
+  USB check but do not make detection instantaneous. A publish or termination
+  notification is only a prompt to collect a fresh snapshot. An attach/remove
+  sequence completed before that snapshot can still be missed if the final
+  inventory matches the baseline.
 - macOS suspends the process during sleep. After wake, the engine compares a new
   stable snapshot with its pre-sleep baseline and shuts down on a difference.
   A device attached and removed entirely while the Mac remained asleep leaves no
   final inventory difference to detect.
-- Detection occurs after macOS enumerates a device. It cannot guarantee that a
-  malicious peripheral has not already interacted with the OS.
+- Detection occurs after macOS begins enumerating and publishing a device. It
+  cannot guarantee that a malicious peripheral has not already interacted with
+  the OS.
 - An administrator/root attacker, or an attacker able to modify the source/app
   before the user approves elevation, is outside the threat model.
 - The detached engine is not automatically supervised or restarted. The menu
@@ -72,12 +86,19 @@ system and does not claim to prevent or contain a malicious device.
   ignored; it never authorizes a broad process kill.
 - **Engine crash:** no automatic restart. Its heartbeat becomes stale and the
   menu app reports a fault while running.
+- **Native event-listener failure:** the menu reports polling fallback, while the
+  shell engine continues its independently timed USB and Thunderbolt checks.
 
 ## Safer operation
 
 Test every relevant device class in dry-run mode before arming real mode. Save
 work before testing, keep the menu app open for health alerts, and disarm before
 planned peripheral changes.
+
+On a Mac laptop with Apple silicon, use macOS accessory security as the primary
+preventive control. Setting **Allow accessories to connect** to **Always Ask**
+requires approval before an accessory receives data access. USB Watchdog remains
+a later detection-and-response layer and is not a replacement for that control.
 
 An unattended root LaunchDaemon is deliberately not included. A secure service
 would require a root-owned, non-user-writable installed engine, an explicit

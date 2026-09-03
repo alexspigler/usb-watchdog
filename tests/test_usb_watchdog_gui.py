@@ -326,6 +326,66 @@ class CommandTests(unittest.TestCase):
         with mock.patch.object(gui.rumps, "alert", return_value=0):
             self.assertFalse(app._confirm_real_mode())
 
+    def test_settings_are_locked_while_an_instance_is_registered(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.dryrun_item = mock.Mock()
+        app.graceful_shutdown_item = mock.Mock()
+        app.immediate_halt_item = mock.Mock()
+        app._set_settings_enabled(False)
+        app.dryrun_item.set_callback.assert_called_once_with(None)
+        app.graceful_shutdown_item.set_callback.assert_called_once_with(None)
+        app.immediate_halt_item.set_callback.assert_called_once_with(None)
+
+    def test_settings_are_restored_after_disarm(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.dryrun_item = mock.Mock()
+        app.graceful_shutdown_item = mock.Mock()
+        app.immediate_halt_item = mock.Mock()
+        app._set_settings_enabled(True)
+        app.dryrun_item.set_callback.assert_called_once_with(app.on_toggle_dryrun)
+        app.graceful_shutdown_item.set_callback.assert_called_once_with(
+            app.on_select_graceful_shutdown
+        )
+        app.immediate_halt_item.set_callback.assert_called_once_with(
+            app.on_select_immediate_halt
+        )
+
+    def test_dry_run_launch_failure_is_reported(self):
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app.dry_run = True
+        app.shutdown_policy = gui.GRACEFUL_THEN_FORCE
+        app.refresh = mock.Mock()
+        with mock.patch.object(gui.os.path, "isfile", return_value=True), mock.patch.object(
+            gui.os, "makedirs"
+        ), mock.patch.object(
+            gui, "open_private_log", side_effect=OSError("log unavailable")
+        ), mock.patch.object(gui.rumps, "alert") as alert:
+            app.arm()
+        self.assertEqual(alert.call_args.args[0], "Arm failed")
+        self.assertIn("log unavailable", alert.call_args.args[1])
+        app.refresh.assert_called_once_with(None)
+
+    def test_disarm_failure_is_reported_without_claiming_success(self):
+        instance = {
+            "pid": 4321,
+            "uid": os.getuid(),
+            "path": "/tmp/watchdog.state",
+            "token": "0123456789abcdef0123456789abcdef",
+        }
+        app = gui.WatchdogApp.__new__(gui.WatchdogApp)
+        app._stop_instance = mock.Mock(return_value=(False, "stop rejected"))
+        app.refresh = mock.Mock()
+        with mock.patch.object(
+            gui, "watchdog_instances", side_effect=[[instance], [], []]
+        ), mock.patch.object(gui.rumps, "alert") as alert, mock.patch.object(
+            gui, "notify"
+        ) as notify:
+            app.disarm()
+        self.assertEqual(alert.call_args.args[0], "Disarm did not complete")
+        self.assertIn("stop rejected", alert.call_args.args[1])
+        notify.assert_not_called()
+        app.refresh.assert_called_once_with(None)
+
 
 if __name__ == "__main__":
     unittest.main()

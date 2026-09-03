@@ -144,6 +144,38 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "DISPLAY:Studio Display serial=ABC123")
 
+    def test_thunderbolt_uid_vendor_and_device_are_included(self):
+        fixture = r'''
++-o Thunderbolt Dock@0  <class IOThunderboltPort, id 1>
+  "Vendor Name" = "CalDigit"
+  "Device Name" = "TS4"
+  "UID" = "0x00ABCDEF12345678"
+'''
+        result = run_sourced(
+            "printf %s " + shlex.quote(fixture) + " | parse_thunderbolt_snapshot"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "TB:uid=0x00ABCDEF12345678 CalDigit / TS4",
+        )
+
+    def test_internal_sd_reader_without_media_is_ignored(self):
+        fixture = """Card Reader:\n    Built in SD Card Reader:\n      Vendor ID: 0x1234\n      Device ID: 0x5678\n      Link Speed: 2.5 GT/s\n"""
+        result = run_sourced(
+            "printf %s " + shlex.quote(fixture) + " | parse_sd_snapshot"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_inserted_sd_media_name_is_included(self):
+        fixture = """Card Reader:\n    Built in SD Card Reader:\n      Vendor ID: 0x1234\n        SDXC Card:\n"""
+        result = run_sourced(
+            "printf %s " + shlex.quote(fixture) + " | parse_sd_snapshot"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "SD:SDXC Card")
+
 
 class StopBoundaryTests(unittest.TestCase):
     def test_stale_exact_record_is_removed_without_pattern_kill(self):
@@ -338,6 +370,28 @@ class ShutdownPolicyTests(unittest.TestCase):
             state_line, "STATE:shutting-down:hardware inventory change detected"
         )
         self.assertNotIn("serial=private", state_line)
+
+    def test_probe_fault_uses_the_selected_common_shutdown_sink(self):
+        result = run_sourced(
+            "DRY_RUN=false\n"
+            "SHUTDOWN_POLICY=force-immediately\n"
+            "write_state() { :; }\n"
+            "do_shutdown() { printf 'SINK:%s:%s:%s\\n' \"$SHUTDOWN_POLICY\" \"$1\" \"$2\"; }\n"
+            "runtime_probe_fault Display"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SINK:force-immediately:PROBE FAULT: Display", result.stdout)
+        self.assertIn("hardware inventory probe failure", result.stdout)
+
+    def test_inventory_change_uses_the_selected_common_shutdown_sink(self):
+        result = run_sourced(
+            "SHUTDOWN_POLICY=graceful-then-force\n"
+            "do_shutdown() { printf 'SINK:%s:%s:%s\\n' \"$SHUTDOWN_POLICY\" \"$1\" \"$2\"; }\n"
+            "process_change 'USB:old' 'USB:new'"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SINK:graceful-then-force:", result.stdout)
+        self.assertIn("hardware inventory change detected", result.stdout)
 
 
 class LiveSnapshotTests(unittest.TestCase):

@@ -9,7 +9,7 @@ device that reproduces the same descriptors can be indistinguishable, and a
 change completed and reversed between polls—or while the Mac is asleep—can be
 missed. Read [SECURITY.md](SECURITY.md) before relying on it.
 
-## Install and run
+## Run from source
 
 Python virtual environments contain absolute paths, so recreate `.venv` after
 moving or renaming this folder:
@@ -19,9 +19,18 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Then either double-click `USB Watchdog.command`, or build and open the local app:
+Then double-click `USB Watchdog.command` or run:
 
 ```sh
+.venv/bin/python usb_watchdog_gui.py
+```
+
+## Build the app
+
+Install the pinned build dependencies and produce a verified local bundle:
+
+```sh
+.venv/bin/python -m pip install -r requirements-build.txt
 ./scripts/build_app.sh
 open "dist/USB Watchdog.app"
 ```
@@ -106,3 +115,19 @@ checks that the bundled shell engine exactly matches the source tree.
 
 The resulting app is for local use. It is not Developer ID signed or notarized
 for distribution.
+
+The same checks run on macOS for pushes and pull requests through the repository
+workflow. App bundling is also exercised there; the generated CI artifact is not
+published as a release.
+
+## Supported environment
+
+The current source, tests, and Apple-silicon app bundle were verified on macOS
+26.6.2 with Python 3.14.7. The project depends on macOS system tools including
+`ioreg`, `system_profiler`, `osascript`, `shutdown`, and `halt`; it is not
+intended for Linux or Windows. Other macOS and Python versions have not yet been
+verified.
+
+## License
+
+Released under the [MIT License](LICENSE).

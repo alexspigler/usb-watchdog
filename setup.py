@@ -10,7 +10,8 @@ Python + rumps) and dock-less (LSUIElement), living only in the menu bar.
 from setuptools import setup
 
 APP = ["usb_watchdog_gui.py"]
-DATA_FILES = ["usb_watchdog.sh"]  # the detection/shutdown engine, bundled in
+DATA_FILES = ["usb_watchdog.sh"]
+VERSION = "1.2.0"
 OPTIONS = {
     "argv_emulation": False,
     "packages": ["rumps"],
@@ -18,16 +19,17 @@ OPTIONS = {
         "CFBundleName": "USB Watchdog",
         "CFBundleDisplayName": "USB Watchdog",
         "CFBundleIdentifier": "com.alexspigler.usbwatchdog",
-        "CFBundleVersion": "1.1.0",
-        "CFBundleShortVersionString": "1.1.0",
+        "CFBundleVersion": VERSION,
+        "CFBundleShortVersionString": VERSION,
         "LSUIElement": True,  # menu-bar-only; no Dock icon, no app menu
-        "NSHumanReadableCopyright": "",
+        "NSHumanReadableCopyright": "Copyright 2026 Alex Spigler",
     },
 }
 
 setup(
     app=APP,
     name="USB Watchdog",
+    version=VERSION,
     data_files=DATA_FILES,
     options={"py2app": OPTIONS},
 )

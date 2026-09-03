@@ -9,6 +9,8 @@ device that reproduces the same descriptors can be indistinguishable, and a
 change completed and reversed between polls—or while the Mac is asleep—can be
 missed. Read [SECURITY.md](SECURITY.md) before relying on it.
 
+![USB Watchdog menu showing dry-run mode and the recommended graceful-shutdown response](docs/usb-watchdog-menu.png)
+
 ## Run from source
 
 Python virtual environments contain absolute paths, so recreate `.venv` after

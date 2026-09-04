@@ -81,7 +81,9 @@ unavailable. PID presence alone is not treated as healthy.
   snapshot.
 - A timed USB and Thunderbolt check remains active every 0.25 seconds plus probe
   execution time. This fallback continues if the listener exits, hangs, or
-  emits an invalid message.
+  emits an invalid message. While polling continues, the engine retries the
+  listener at a bounded interval and returns to event-triggered checks after a
+  successful restart.
 - USB fingerprints include location, vendor/product IDs, serial and product
   strings, USB and device revisions, device class, maximum control-packet size,
   configuration count, and a sorted profile of the interfaces macOS publishes.

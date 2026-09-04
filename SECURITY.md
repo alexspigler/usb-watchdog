@@ -89,7 +89,8 @@ system and does not claim to prevent or contain a malicious device.
   menu app reports a fault while running.
 - **Native event-listener failure:** the menu reports polling fallback, while the
   shell engine continues its independently timed USB and Thunderbolt checks. The
-  engine makes a fresh listener-start attempt after the next wake.
+  engine retries the listener at a bounded interval and also replaces it after a
+  detected wake.
 
 ## Safer operation
 

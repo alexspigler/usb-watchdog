@@ -46,6 +46,7 @@ WAKE_SETTLE_SECONDS=2
 GRACEFUL_SHUTDOWN_SECONDS=5
 EVENT_START_TIMEOUT_SECONDS=2
 EVENT_HEARTBEAT_TIMEOUT_SECONDS=3
+EVENT_RETRY_SECONDS=5
 
 DRY_RUN=false
 SNAPSHOT_ONLY=false
@@ -65,7 +66,9 @@ EVENT_MONITOR_PID=""
 EVENT_MONITOR_FD=9
 EVENT_MONITOR_FD_OPEN=false
 EVENT_LAST_HEARTBEAT=0
+EVENT_LAST_START_ATTEMPT=0
 EVENT_MONITOR_UID=""
+EVENT_MONITOR_RETRY_ENABLED=false
 
 usage() {
     /usr/bin/awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
@@ -158,6 +161,12 @@ run_with_timeout() {
         "$seconds" "$@"
 }
 
+# Bash's process timer is not a reliable measure of time spent in system sleep
+# on every macOS wake path. Epoch time advances while the machine is asleep.
+wall_time() {
+    /bin/date +%s
+}
+
 event_monitor_path() {
     local candidate
     for candidate in \
@@ -196,6 +205,7 @@ stop_usb_event_monitor() {
 
 start_usb_event_monitor() {
     local helper ready_message
+    EVENT_LAST_START_ATTEMPT=$(wall_time) || return 1
     helper=$(event_monitor_path) || return 1
 
     if [[ $EUID -eq 0 ]]; then
@@ -249,6 +259,20 @@ restart_usb_event_monitor_after_wake() {
     return 1
 }
 
+retry_usb_event_monitor_if_due() {
+    local now
+    [[ "$EVENT_MONITOR_RETRY_ENABLED" == true ]] || return 1
+    [[ "$EVENT_MONITOR_ACTIVE" != true ]] || return 0
+    now=$(wall_time) || return 1
+    (( now - EVENT_LAST_START_ATTEMPT >= EVENT_RETRY_SECONDS )) || return 1
+
+    if start_usb_event_monitor; then
+        echo "$(/bin/date '+%H:%M:%S') USB event monitor restored after polling fallback."
+        return 0
+    fi
+    return 1
+}
+
 read_event_with_timeout() {
     local timeout="$1"
     /usr/bin/perl -e '
@@ -280,7 +304,10 @@ read_event_with_timeout() {
 }
 
 wait_for_fast_check() {
-    local cycle_started="${1:-$SECONDS}" message read_status
+    local cycle_started_wall="${1:-}" message now_wall read_status
+    if [[ -z "$cycle_started_wall" ]]; then
+        cycle_started_wall=$(wall_time) || cycle_started_wall=0
+    fi
     if [[ "$EVENT_MONITOR_ACTIVE" != true ]]; then
         /bin/sleep "$FAST_INTERVAL"
         return 0
@@ -305,21 +332,22 @@ wait_for_fast_check() {
         read_status=$?
     fi
 
-    if (( read_status != 1 )); then
-        mark_event_monitor_unavailable "event stream read failure $read_status"
-        return 0
-    fi
-
     if ! /bin/kill -0 "$EVENT_MONITOR_PID" 2>/dev/null; then
         mark_event_monitor_unavailable "listener process exited"
         return 0
     fi
 
-    # Both processes pause during sleep. A clean timeout from a still-running
-    # helper is therefore a wake signal, not proof that its heartbeat failed.
-    # Give the resumed helper one normal heartbeat window to report again.
-    if (( SECONDS - cycle_started > WAKE_GAP_SECONDS )); then
+    # A still-running helper can return a timeout or interrupted stream as the
+    # system wakes. Let the outer loop recognize that sleep interval and replace
+    # the listener instead of treating this first read result as a lasting fault.
+    now_wall=$(wall_time) || now_wall="$cycle_started_wall"
+    if (( now_wall - cycle_started_wall > WAKE_GAP_SECONDS )); then
         EVENT_LAST_HEARTBEAT=$SECONDS
+        return 0
+    fi
+
+    if (( read_status != 1 )); then
+        mark_event_monitor_unavailable "event stream read failure $read_status"
         return 0
     fi
 
@@ -900,16 +928,17 @@ signal_exit() {
 }
 
 monitor_loop() {
-    local fast_current slow_current cycle last_cycle now
+    local fast_current slow_current cycle last_cycle_wall now_wall
     cycle=0
-    last_cycle=$SECONDS
+    last_cycle_wall=$(wall_time) || return 1
 
     while true; do
-        wait_for_fast_check "$last_cycle"
+        retry_usb_event_monitor_if_due || true
+        wait_for_fast_check "$last_cycle_wall"
         stop_requested && return 0
-        now=$SECONDS
+        now_wall=$(wall_time) || return 1
 
-        if (( now - last_cycle > WAKE_GAP_SECONDS )); then
+        if (( now_wall - last_cycle_wall > WAKE_GAP_SECONDS )); then
             write_state "settling" "system wake detected"
             /bin/sleep "$WAKE_SETTLE_SECONDS"
             # Re-register IOKit notifications after every wake. The listener can
@@ -921,14 +950,14 @@ monitor_loop() {
             fast_current=$(collect_stable_snapshot fast) || {
                 stop_requested && return 0
                 runtime_probe_fault "post-wake USB/Thunderbolt" || true
-                last_cycle=$SECONDS
+                last_cycle_wall=$(wall_time) || return 1
                 continue
             }
             FAST_HEALTHY=true
             slow_current=$(collect_stable_snapshot slow) || {
                 stop_requested && return 0
                 runtime_probe_fault "post-wake SD/display" || true
-                last_cycle=$SECONDS
+                last_cycle_wall=$(wall_time) || return 1
                 continue
             }
             SLOW_HEALTHY=true
@@ -944,7 +973,7 @@ monitor_loop() {
             fi
             write_monitoring_state
             cycle=0
-            last_cycle=$SECONDS
+            last_cycle_wall=$(wall_time) || return 1
             continue
         fi
 
@@ -953,7 +982,7 @@ monitor_loop() {
             write_state "degraded" "USB/Thunderbolt probe retrying"
             fast_current=$(read_snapshot_with_retries fast) || {
                 runtime_probe_fault "USB/Thunderbolt" || true
-                last_cycle=$SECONDS
+                last_cycle_wall=$(wall_time) || return 1
                 continue
             }
         fi
@@ -966,7 +995,7 @@ monitor_loop() {
                 fast_current=$(read_snapshot_with_retries fast) || {
                     FAST_HEALTHY=false
                     runtime_probe_fault "USB/Thunderbolt confirmation" || true
-                    last_cycle=$SECONDS
+                    last_cycle_wall=$(wall_time) || return 1
                     continue
                 }
                 if [[ "$fast_current" != "$FAST_BASE" ]]; then
@@ -985,7 +1014,7 @@ monitor_loop() {
                 write_state "degraded" "SD/display probe retrying"
                 slow_current=$(read_snapshot_with_retries slow) || {
                     runtime_probe_fault "SD/display" || true
-                    last_cycle=$SECONDS
+                    last_cycle_wall=$(wall_time) || return 1
                     continue
                 }
             fi
@@ -996,7 +1025,7 @@ monitor_loop() {
                     slow_current=$(read_snapshot_with_retries slow) || {
                         SLOW_HEALTHY=false
                         runtime_probe_fault "SD/display confirmation" || true
-                        last_cycle=$SECONDS
+                        last_cycle_wall=$(wall_time) || return 1
                         continue
                     }
                     if [[ "$slow_current" != "$SLOW_BASE" ]]; then
@@ -1009,7 +1038,7 @@ monitor_loop() {
         fi
 
         write_heartbeat
-        last_cycle=$SECONDS
+        last_cycle_wall=$(wall_time) || return 1
     done
 }
 
@@ -1053,6 +1082,7 @@ main() {
         exit 2
     fi
 
+    EVENT_MONITOR_RETRY_ENABLED=true
     if ! start_usb_event_monitor; then
         echo "$(/bin/date '+%H:%M:%S') Native USB event monitor unavailable; using polling only."
     fi

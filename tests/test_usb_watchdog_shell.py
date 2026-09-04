@@ -585,14 +585,16 @@ class EventFallbackTests(unittest.TestCase):
         self.assertIn("polling fallback remains active", result.stdout)
         self.assertIn("MODE:false:false", result.stdout)
 
-    def test_monitor_loop_refreshes_listener_before_post_wake_snapshot(self):
+    def test_wall_clock_wake_refreshes_listener_when_seconds_does_not_advance(self):
         result = run_sourced(
             "WAKE_GAP_SECONDS=2\n"
             "WAKE_SETTLE_SECONDS=0\n"
             "FAST_BASE=BASE\n"
             "SLOW_BASE=BASE\n"
             "stop_calls=0\n"
-            "wait_for_fast_check() { SECONDS=$((SECONDS + 10)); }\n"
+            "TEST_WALL=100\n"
+            "wall_time() { printf %s \"$TEST_WALL\"; }\n"
+            "wait_for_fast_check() { TEST_WALL=$((TEST_WALL + 10)); }\n"
             "stop_requested() {\n"
             "  stop_calls=$((stop_calls + 1))\n"
             "  (( stop_calls > 1 ))\n"
@@ -610,6 +612,50 @@ class EventFallbackTests(unittest.TestCase):
         self.assertIn("STATE:settling:system wake detected", result.stdout)
         self.assertIn("RESTART", result.stdout)
         self.assertIn("STATE:ready:", result.stdout)
+
+    def test_polling_fallback_retries_listener_when_due(self):
+        result = run_sourced(
+            "EVENT_MONITOR_RETRY_ENABLED=true\n"
+            "EVENT_MONITOR_ACTIVE=false\n"
+            "EVENT_MONITOR_HEALTHY=false\n"
+            "EVENT_LAST_START_ATTEMPT=100\n"
+            "EVENT_RETRY_SECONDS=5\n"
+            "TEST_WALL=105\n"
+            "wall_time() { printf %s \"$TEST_WALL\"; }\n"
+            "start_usb_event_monitor() {\n"
+            "  printf 'START\\n'\n"
+            "  EVENT_MONITOR_ACTIVE=true\n"
+            "  EVENT_MONITOR_HEALTHY=true\n"
+            "}\n"
+            "retry_usb_event_monitor_if_due\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" "
+            "\"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("START", result.stdout)
+        self.assertIn("restored after polling fallback", result.stdout)
+        self.assertIn("MODE:true:true", result.stdout)
+
+    def test_listener_retry_is_bounded_after_failed_attempt(self):
+        result = run_sourced(
+            "EVENT_MONITOR_RETRY_ENABLED=true\n"
+            "EVENT_MONITOR_ACTIVE=false\n"
+            "EVENT_LAST_START_ATTEMPT=100\n"
+            "EVENT_RETRY_SECONDS=5\n"
+            "TEST_WALL=105\n"
+            "ATTEMPTS=0\n"
+            "wall_time() { printf %s \"$TEST_WALL\"; }\n"
+            "start_usb_event_monitor() {\n"
+            "  ATTEMPTS=$((ATTEMPTS + 1))\n"
+            "  EVENT_LAST_START_ATTEMPT=$TEST_WALL\n"
+            "  return 1\n"
+            "}\n"
+            "retry_usb_event_monitor_if_due || true\n"
+            "retry_usb_event_monitor_if_due || true\n"
+            "printf 'ATTEMPTS:%s' \"$ATTEMPTS\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ATTEMPTS:1")
 
     def test_partial_helper_line_cannot_block_polling_fallback(self):
         started = time.monotonic()
@@ -771,6 +817,7 @@ class EventFallbackTests(unittest.TestCase):
             "EVENT_HEARTBEAT_TIMEOUT_SECONDS=3\n"
             "WAKE_GAP_SECONDS=2\n"
             "SECONDS=10\n"
+            "wall_time() { printf 10; }\n"
             "read_event_with_timeout() { return 1; }\n"
             "wait_for_fast_check 0\n"
             "printf 'MODE:%s:%s AGE:%s' "
@@ -790,10 +837,12 @@ class EventFallbackTests(unittest.TestCase):
             "EVENT_HEARTBEAT_TIMEOUT_SECONDS=3\n"
             "WAKE_GAP_SECONDS=2\n"
             "SECONDS=10\n"
+            "TEST_WALL=10\n"
+            "wall_time() { printf %s \"$TEST_WALL\"; }\n"
             "read_event_with_timeout() { return 1; }\n"
             "wait_for_fast_check 0\n"
             "read_event_with_timeout() { printf heartbeat; }\n"
-            "wait_for_fast_check \"$SECONDS\"\n"
+            "wait_for_fast_check \"$TEST_WALL\"\n"
             "printf 'MODE:%s:%s AGE:%s' "
             '"$EVENT_MONITOR_ACTIVE" "$EVENT_MONITOR_HEALTHY" '
             '"$((SECONDS - EVENT_LAST_HEARTBEAT))"'
@@ -814,11 +863,13 @@ class EventFallbackTests(unittest.TestCase):
             "FAST_HEALTHY=true\n"
             "SLOW_HEALTHY=true\n"
             "SECONDS=10\n"
+            "TEST_WALL=10\n"
+            "wall_time() { printf %s \"$TEST_WALL\"; }\n"
             "read_event_with_timeout() { return 1; }\n"
             "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
             "wait_for_fast_check 0\n"
             "SECONDS=$((EVENT_LAST_HEARTBEAT + EVENT_HEARTBEAT_TIMEOUT_SECONDS + 1))\n"
-            "wait_for_fast_check \"$SECONDS\"\n"
+            "wait_for_fast_check \"$TEST_WALL\"\n"
             "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" \"$EVENT_MONITOR_HEALTHY\""
         )
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -15,6 +15,7 @@ DATA_FILES = ["usb_watchdog.sh"]
 VERSION = "1.3.0"
 OPTIONS = {
     "argv_emulation": False,
+    "excludes": ["tkinter"],
     "packages": ["rumps"],
     "plist": {
         "CFBundleName": "USB Watchdog",

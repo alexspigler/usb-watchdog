@@ -4,10 +4,10 @@ USB Watchdog is a macOS menu-bar tamper alarm. It records the observable USB,
 Thunderbolt, SD-card, and external-display inventory, then initiates shutdown if
 that inventory changes.
 
-It is intentionally conservative, but it is not device authentication. A
-device that reproduces the same descriptor and interface profile can be
-indistinguishable, and a change made and reversed while the Mac is asleep can be
-missed. Read [SECURITY.md](SECURITY.md) before relying on it.
+When armed, it combines native USB event notifications with independent polling
+and a stable hardware baseline. Removing, replacing, or adding a monitored
+peripheral starts the selected shutdown response. [SECURITY.md](SECURITY.md)
+describes the threat model and operating guidance.
 
 ![USB Watchdog menu showing dry-run mode and the recommended graceful-shutdown response](docs/usb-watchdog-menu.png)
 
@@ -93,11 +93,12 @@ unavailable. PID presence alone is not treated as healthy.
 - In real mode, a persistent inventory-probe failure fails closed by initiating
   shutdown. In dry-run mode, it reports a fault and retains the last known-good
   baseline until that probe group recovers.
-- After wake, the engine waits briefly for hardware to settle, restarts the
-  native listener so IOKit notifications are freshly registered, and compares a
-  new stable snapshot with the pre-sleep baseline. A remaining difference
-  initiates shutdown. If the listener cannot restart, timed polling continues
-  and the menu reports the fallback.
+- Locking the screen does not pause the engine while macOS remains awake;
+  inventory monitoring and shutdown behavior continue normally.
+- After wake, the engine waits briefly for hardware to settle, restores native
+  event monitoring, and compares a fresh stable inventory with the pre-sleep
+  baseline. Any remaining difference starts the selected shutdown response.
+  Independent polling continues if the event listener cannot restart.
 - The recommended shutdown response first requests the normal syncing macOS
   shutdown. If the machine is still running after 5 seconds, the engine
   repeatedly requests a forced quick halt.
@@ -112,11 +113,11 @@ if monitoring should end.
 The menu app controls only the two exact instances it registered. A watchdog
 started directly in Terminal without a state file remains independent.
 
-On a Mac laptop with Apple silicon, set **System Settings → Privacy & Security →
-Allow accessories to connect** to **Always Ask** for a stronger preventive
-layer. macOS then requires approval before an accessory receives data access;
-USB Watchdog remains a separate detection-and-response layer. See [Apple's
-accessory-security guidance](https://support.apple.com/102282).
+On a Mac laptop with Apple silicon, setting **System Settings → Privacy &
+Security → Allow accessories to connect** to **Always Ask** adds an approval
+gate for accessory data access. This complements USB Watchdog: macOS controls
+access while the watchdog detects inventory changes and initiates shutdown.
+See [Apple's accessory-security guidance](https://support.apple.com/102282).
 
 ## Command-line checks
 

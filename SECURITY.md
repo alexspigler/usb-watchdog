@@ -2,13 +2,15 @@
 
 ## Intended property
 
-After a complete stable baseline has been established, a successfully observed
-change in the USB, Thunderbolt, SD-card, or external-display inventory causes
-the real-mode engine to begin shutdown. Persistent loss of an inventory probe
-also fails closed in real mode.
+USB Watchdog is a local peripheral-tamper alarm designed to turn an observed
+hardware change into a shutdown response quickly. After a complete stable
+baseline has been established, a successfully observed change in the USB,
+Thunderbolt, SD-card, or external-display inventory causes the real-mode engine
+to begin shutdown. Persistent loss of an inventory probe also fails closed.
 
-This is a local tamper alarm. It is not a cryptographic peripheral identity
-system and does not claim to prevent or contain a malicious device.
+The engine combines native USB event notifications, independent polling, stable
+snapshot comparison, and post-wake reconciliation. Its security boundary is
+observable hardware inventory rather than firmware authentication.
 
 ## Trust boundaries and invariants
 
@@ -43,6 +45,11 @@ system and does not claim to prevent or contain a malicious device.
   or repairs both log files as owner-readable only and refuses symlink or
   non-file log targets. The root-readable state contains only a generic event
   summary rather than the device-bearing shutdown reason.
+- Locking the screen does not stop the engine while macOS remains awake.
+- After wake, the engine restores the native listener and compares a fresh
+  stable inventory with the pre-sleep baseline before resuming its normal loop.
+  A changed inventory reaches the same shutdown path as any other detected
+  change.
 
 ## Explicit limitations
 
@@ -51,19 +58,9 @@ system and does not claim to prevent or contain a malicious device.
   interface profiles are device- or OS-reported observations. They can be absent
   or spoofed. A device that reproduces the complete observed profile may remain
   indistinguishable.
-- IOKit device and interface notifications reduce the ordinary delay before a
-  USB check but do not make detection instantaneous. A publish or termination
-  notification is only a prompt to collect a fresh snapshot. An attach/remove
-  sequence completed before that snapshot can still be missed if the final
-  inventory matches the baseline.
-- macOS suspends the process during sleep. After wake, the engine restarts the
-  native listener, compares a new stable snapshot with its pre-sleep baseline,
-  and shuts down on a difference. If listener restart fails, independent polling
-  remains active and visibly degraded. A device attached and removed entirely
-  while the Mac remained asleep leaves no final inventory difference to detect.
-- Detection occurs after macOS begins enumerating and publishing a device. It
-  cannot guarantee that a malicious peripheral has not already interacted with
-  the OS.
+- Detection begins after macOS publishes a device. Native notifications request
+  a fresh inventory immediately, while independent polling remains available as
+  a fallback; neither path is firmware authentication.
 - An administrator/root attacker, or an attacker able to modify the source/app
   before the user approves elevation, is outside the threat model.
 - The detached engine is not automatically supervised or restarted. The menu
@@ -92,16 +89,16 @@ system and does not claim to prevent or contain a malicious device.
   engine retries the listener at a bounded interval and also replaces it after a
   detected wake.
 
-## Safer operation
+## Recommended operation
 
 Test every relevant device class in dry-run mode before arming real mode. Save
 work before testing, keep the menu app open for health alerts, and disarm before
 planned peripheral changes.
 
-On a Mac laptop with Apple silicon, use macOS accessory security as the primary
-preventive control. Setting **Allow accessories to connect** to **Always Ask**
-requires approval before an accessory receives data access. USB Watchdog remains
-a later detection-and-response layer and is not a replacement for that control.
+On a Mac laptop with Apple silicon, setting **Allow accessories to connect** to
+**Always Ask** adds an approval gate for accessory data access. This complements
+USB Watchdog: macOS controls access while the watchdog detects inventory changes
+and initiates shutdown.
 
 An unattended root LaunchDaemon is deliberately not included. A secure service
 would require a root-owned, non-user-writable installed engine, an explicit

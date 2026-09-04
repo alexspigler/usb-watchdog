@@ -24,6 +24,7 @@ jobs:
 
       - name: Install pinned build dependencies
         run: |
+          brew install shellcheck
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -r requirements-build.txt

@@ -4,7 +4,7 @@ USB Watchdog is a macOS menu-bar tamper alarm. It records the observable USB,
 Thunderbolt, SD-card, and external-display inventory, then initiates shutdown if
 that inventory changes.
 
-It is intentionally conservative, but it is **not device authentication**. A
+It is intentionally conservative, but it is not device authentication. A
 device that reproduces the same descriptor and interface profile can be
 indistinguishable, and a change made and reversed while the Mac is asleep can be
 missed. Read [SECURITY.md](SECURITY.md) before relying on it.
@@ -111,7 +111,7 @@ The menu app controls only the two exact instances it registered. A watchdog
 started directly in Terminal without a state file remains independent.
 
 On a Mac laptop with Apple silicon, set **System Settings → Privacy & Security →
-Allow accessories to connect** to **Always Ask** for the stronger preventive
+Allow accessories to connect** to **Always Ask** for a stronger preventive
 layer. macOS then requires approval before an accessory receives data access;
 USB Watchdog remains a separate detection-and-response layer. See [Apple's
 accessory-security guidance](https://support.apple.com/102282).

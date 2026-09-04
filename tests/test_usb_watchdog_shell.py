@@ -545,6 +545,72 @@ class NativeEventMonitorTests(unittest.TestCase):
 
 
 class EventFallbackTests(unittest.TestCase):
+    def test_wake_restart_replaces_listener_and_restores_health(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=123\n"
+            "stop_usb_event_monitor() {\n"
+            "  printf 'STOP\\n'\n"
+            "  EVENT_MONITOR_ACTIVE=false\n"
+            "  EVENT_MONITOR_PID=\n"
+            "}\n"
+            "start_usb_event_monitor() {\n"
+            "  printf 'START\\n'\n"
+            "  EVENT_MONITOR_ACTIVE=true\n"
+            "  EVENT_MONITOR_HEALTHY=true\n"
+            "  EVENT_MONITOR_PID=456\n"
+            "  return 0\n"
+            "}\n"
+            "restart_usb_event_monitor_after_wake\n"
+            "printf 'MODE:%s:%s:%s' \"$EVENT_MONITOR_ACTIVE\" "
+            "\"$EVENT_MONITOR_HEALTHY\" \"$EVENT_MONITOR_PID\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STOP", result.stdout)
+        self.assertIn("START", result.stdout)
+        self.assertIn("MODE:true:true:456", result.stdout)
+
+    def test_failed_wake_restart_leaves_polling_fallback(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "stop_usb_event_monitor() { EVENT_MONITOR_ACTIVE=false; }\n"
+            "start_usb_event_monitor() { return 1; }\n"
+            "restart_usb_event_monitor_after_wake || true\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" "
+            "\"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("polling fallback remains active", result.stdout)
+        self.assertIn("MODE:false:false", result.stdout)
+
+    def test_monitor_loop_refreshes_listener_before_post_wake_snapshot(self):
+        result = run_sourced(
+            "WAKE_GAP_SECONDS=2\n"
+            "WAKE_SETTLE_SECONDS=0\n"
+            "FAST_BASE=BASE\n"
+            "SLOW_BASE=BASE\n"
+            "stop_calls=0\n"
+            "wait_for_fast_check() { SECONDS=$((SECONDS + 10)); }\n"
+            "stop_requested() {\n"
+            "  stop_calls=$((stop_calls + 1))\n"
+            "  (( stop_calls > 1 ))\n"
+            "}\n"
+            "write_state() { printf 'STATE:%s:%s\\n' \"$1\" \"$2\"; }\n"
+            "restart_usb_event_monitor_after_wake() {\n"
+            "  printf 'RESTART\\n'\n"
+            "  EVENT_MONITOR_HEALTHY=true\n"
+            "}\n"
+            "collect_stable_snapshot() { printf BASE; }\n"
+            "process_change() { return 0; }\n"
+            "monitor_loop"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STATE:settling:system wake detected", result.stdout)
+        self.assertIn("RESTART", result.stdout)
+        self.assertIn("STATE:ready:", result.stdout)
+
     def test_partial_helper_line_cannot_block_polling_fallback(self):
         started = time.monotonic()
         result = run_sourced(
@@ -582,6 +648,19 @@ class EventFallbackTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "stopped")
         self.assertLess(elapsed, 1.5)
+
+    def test_stopped_listener_cannot_remain_marked_healthy(self):
+        result = run_sourced(
+            "EVENT_MONITOR_ACTIVE=true\n"
+            "EVENT_MONITOR_HEALTHY=true\n"
+            "EVENT_MONITOR_PID=\n"
+            "EVENT_MONITOR_FD_OPEN=false\n"
+            "stop_usb_event_monitor\n"
+            "printf 'MODE:%s:%s' \"$EVENT_MONITOR_ACTIVE\" "
+            "\"$EVENT_MONITOR_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "MODE:false:false")
 
     def test_event_hint_wakes_without_waiting_for_poll_timeout(self):
         started = time.monotonic()

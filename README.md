@@ -91,9 +91,11 @@ unavailable. PID presence alone is not treated as healthy.
 - In real mode, a persistent inventory-probe failure fails closed by initiating
   shutdown. In dry-run mode, it reports a fault and retains the last known-good
   baseline until that probe group recovers.
-- After wake, the engine waits briefly for hardware to settle and compares a new
-  stable snapshot with the pre-sleep baseline. A remaining difference initiates
-  shutdown.
+- After wake, the engine waits briefly for hardware to settle, restarts the
+  native listener so IOKit notifications are freshly registered, and compares a
+  new stable snapshot with the pre-sleep baseline. A remaining difference
+  initiates shutdown. If the listener cannot restart, timed polling continues
+  and the menu reports the fallback.
 - The recommended shutdown response first requests the normal syncing macOS
   shutdown. If the machine is still running after 5 seconds, the engine
   repeatedly requests a forced quick halt.

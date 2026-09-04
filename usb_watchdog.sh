@@ -190,6 +190,7 @@ stop_usb_event_monitor() {
         wait "$pid" 2>/dev/null || true
     fi
     EVENT_MONITOR_ACTIVE=false
+    EVENT_MONITOR_HEALTHY=false
     EVENT_MONITOR_PID=""
 }
 
@@ -225,14 +226,27 @@ start_usb_event_monitor() {
 }
 
 mark_event_monitor_unavailable() {
+    local reason="${1:-unknown listener failure}"
     stop_usb_event_monitor
     EVENT_MONITOR_HEALTHY=false
-    echo "$(/bin/date '+%H:%M:%S') USB event monitor unavailable; polling fallback remains active."
+    echo "$(/bin/date '+%H:%M:%S') USB event monitor unavailable ($reason); polling fallback remains active."
     if [[ "$FAST_HEALTHY" == true && "$SLOW_HEALTHY" == true ]]; then
-        write_state "polling" "USB event monitor unavailable; polling fallback active" || true
+        write_state "polling" "USB event monitor unavailable ($reason); polling fallback active" || true
     else
-        write_state "fault" "event monitor unavailable and an inventory probe is unhealthy" || true
+        write_state "fault" "event monitor unavailable ($reason) and an inventory probe is unhealthy" || true
     fi
+}
+
+restart_usb_event_monitor_after_wake() {
+    stop_usb_event_monitor
+    EVENT_MONITOR_HEALTHY=false
+    if start_usb_event_monitor; then
+        echo "$(/bin/date '+%H:%M:%S') USB event monitor restarted after wake."
+        return 0
+    fi
+
+    echo "$(/bin/date '+%H:%M:%S') USB event monitor could not restart after wake; polling fallback remains active."
+    return 1
 }
 
 read_event_with_timeout() {
@@ -283,7 +297,7 @@ wait_for_fast_check() {
                 return 0
                 ;;
             *)
-                mark_event_monitor_unavailable
+                mark_event_monitor_unavailable "invalid event message"
                 return 0
                 ;;
         esac
@@ -291,9 +305,13 @@ wait_for_fast_check() {
         read_status=$?
     fi
 
-    if (( read_status != 1 )) ||
-        ! /bin/kill -0 "$EVENT_MONITOR_PID" 2>/dev/null; then
-        mark_event_monitor_unavailable
+    if (( read_status != 1 )); then
+        mark_event_monitor_unavailable "event stream read failure $read_status"
+        return 0
+    fi
+
+    if ! /bin/kill -0 "$EVENT_MONITOR_PID" 2>/dev/null; then
+        mark_event_monitor_unavailable "listener process exited"
         return 0
     fi
 
@@ -306,7 +324,7 @@ wait_for_fast_check() {
     fi
 
     if (( SECONDS - EVENT_LAST_HEARTBEAT > EVENT_HEARTBEAT_TIMEOUT_SECONDS )); then
-        mark_event_monitor_unavailable
+        mark_event_monitor_unavailable "listener heartbeat stale"
     fi
 }
 
@@ -894,6 +912,10 @@ monitor_loop() {
         if (( now - last_cycle > WAKE_GAP_SECONDS )); then
             write_state "settling" "system wake detected"
             /bin/sleep "$WAKE_SETTLE_SECONDS"
+            # Re-register IOKit notifications after every wake. The listener can
+            # exit or its stream can become unusable across system sleep even
+            # while the independently timed polling engine remains healthy.
+            restart_usb_event_monitor_after_wake || true
             FAST_HEALTHY=false
             SLOW_HEALTHY=false
             fast_current=$(collect_stable_snapshot fast) || {

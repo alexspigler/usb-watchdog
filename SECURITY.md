@@ -56,10 +56,11 @@ system and does not claim to prevent or contain a malicious device.
   notification is only a prompt to collect a fresh snapshot. An attach/remove
   sequence completed before that snapshot can still be missed if the final
   inventory matches the baseline.
-- macOS suspends the process during sleep. After wake, the engine compares a new
-  stable snapshot with its pre-sleep baseline and shuts down on a difference.
-  A device attached and removed entirely while the Mac remained asleep leaves no
-  final inventory difference to detect.
+- macOS suspends the process during sleep. After wake, the engine restarts the
+  native listener, compares a new stable snapshot with its pre-sleep baseline,
+  and shuts down on a difference. If listener restart fails, independent polling
+  remains active and visibly degraded. A device attached and removed entirely
+  while the Mac remained asleep leaves no final inventory difference to detect.
 - Detection occurs after macOS begins enumerating and publishing a device. It
   cannot guarantee that a malicious peripheral has not already interacted with
   the OS.
@@ -87,7 +88,8 @@ system and does not claim to prevent or contain a malicious device.
 - **Engine crash:** no automatic restart. Its heartbeat becomes stale and the
   menu app reports a fault while running.
 - **Native event-listener failure:** the menu reports polling fallback, while the
-  shell engine continues its independently timed USB and Thunderbolt checks.
+  shell engine continues its independently timed USB and Thunderbolt checks. The
+  engine makes a fresh listener-start attempt after the next wake.
 
 ## Safer operation
 

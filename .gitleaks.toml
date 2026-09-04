@@ -1,0 +1,11 @@
+title = "USB Watchdog gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fixed dummy instance token used in tests"
+regexTarget = "match"
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',
+]

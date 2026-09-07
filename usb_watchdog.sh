@@ -34,7 +34,7 @@
 
 # Polling and failure-policy configuration. USB events request an immediate
 # inventory check when the native helper is available. The timed loop remains a
-# fallback. The slow cadence includes 12 waits, 12 fast probes, and a slow probe.
+# fallback. Slow probes start after 12 fast cycles and run in the background.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 FAST_INTERVAL=0.25
 SLOW_CYCLES=12
@@ -69,6 +69,13 @@ EVENT_LAST_HEARTBEAT=0
 EVENT_LAST_START_ATTEMPT=0
 EVENT_MONITOR_UID=""
 EVENT_MONITOR_RETRY_ENABLED=false
+FAST_CURRENT=""
+SLOW_WORK_DIR=""
+SLOW_WORK_PID=""
+SLOW_WORK_STARTED=0
+SLOW_WORK_ATTEMPT=0
+SLOW_WORK_LIMIT=0
+SLOW_CONFIRMING=false
 
 usage() {
     /usr/bin/awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
@@ -580,6 +587,34 @@ get_fast_snapshot() {
     merge_snapshots "$usb" "$thunderbolt"
 }
 
+# Compare USB before starting another device class's probe. A native event is
+# still only a hint: the bounded, successful USB inventory authorizes the action.
+read_fast_snapshot_for_monitor() {
+    local usb thunderbolt usb_base="" other_base="" line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        case "$line" in
+            USB:*) usb_base+="$line"$'\n' ;;
+            *) other_base+="$line"$'\n' ;;
+        esac
+    done <<< "$FAST_BASE"
+    usb_base=${usb_base%$'\n'}
+    other_base=${other_base%$'\n'}
+
+    usb=$(snapshot_getter usb) || return 1
+    if [[ "$usb" != "$usb_base" ]]; then
+        if ! process_change "$usb_base" "$usb"; then
+            # Only dry-run reaches confirmation. Retain the old baseline if it
+            # fails, and do not let a reverting read erase the observed change.
+            usb=$(read_snapshot_with_retries usb) || return 1
+            FAST_BASE=$(merge_snapshots "$usb" "$other_base") || return 1
+            echo "$(/bin/date '+%H:%M:%S') Dry-run USB baseline updated."
+        fi
+    fi
+    thunderbolt=$(get_thunderbolt_snapshot) || return 1
+    FAST_CURRENT=$(merge_snapshots "$usb" "$thunderbolt")
+}
+
 get_slow_snapshot() {
     local sd displays
     sd=$(get_sd_snapshot) || return 1
@@ -596,11 +631,136 @@ get_device_snapshot() {
 
 snapshot_getter() {
     case "$1" in
+        usb)
+            local usb
+            usb=$(get_usb_snapshot) || return 1
+            merge_snapshots "$usb" ""
+            ;;
         fast) get_fast_snapshot ;;
         slow) get_slow_snapshot ;;
         all)  get_device_snapshot ;;
         *) return 2 ;;
     esac
+}
+
+# Each slow sample runs in a child of the trusted engine, never in the mutable
+# event helper. A private result is consumed only after successful child exit,
+# so partial/failed output is not a snapshot. Only the parent can shut down.
+start_slow_probe() {
+    [[ -z "$SLOW_WORK_PID" ]] || return 1
+    if [[ -z "$SLOW_WORK_DIR" ]]; then
+        SLOW_WORK_DIR=$(/usr/bin/mktemp -d /private/tmp/usb-watchdog-slow.XXXXXXXX) || return 1
+    fi
+    SLOW_WORK_STARTED=$(wall_time) || return 1
+    SLOW_WORK_ATTEMPT=$((SLOW_WORK_ATTEMPT + 1))
+    (
+        trap - EXIT INT TERM
+        exec 9<&-
+        # Open the output before any probe. Descendants inherit this descriptor
+        # and cannot recreate a result pathname after the parent cancels us.
+        {
+            if output=$(get_slow_snapshot); then
+                printf 'ok\n%s' "$output"
+            else
+                printf 'failed\n'
+            fi
+        } > "$SLOW_WORK_DIR/result"
+    ) &
+    SLOW_WORK_PID=$!
+}
+
+slow_probe_running() {
+    local child
+    # Bash can retain completed jobs in its table. Only running or stopped jobs
+    # are pending; an unfiltered `jobs -p` can mistake Done for still running.
+    for child in $(
+        jobs -pr
+        jobs -ps
+    ); do
+        [[ "$child" == "$SLOW_WORK_PID" ]] && return 0
+    done
+    return 1
+}
+
+stop_slow_probe() {
+    if [[ -n "$SLOW_WORK_PID" ]]; then
+        if slow_probe_running; then
+            kill -KILL "$SLOW_WORK_PID" 2>/dev/null || true
+        fi
+        wait "$SLOW_WORK_PID" 2>/dev/null || true
+        SLOW_WORK_PID=""
+    fi
+    if [[ -n "$SLOW_WORK_DIR" ]]; then
+        /bin/rm -f "$SLOW_WORK_DIR/result"
+        /bin/rmdir "$SLOW_WORK_DIR" 2>/dev/null || true
+        SLOW_WORK_DIR=""
+    fi
+}
+
+begin_slow_check() {
+    SLOW_WORK_ATTEMPT=0
+    SLOW_WORK_LIMIT=$((PROBE_RETRIES + 1))
+    SLOW_CONFIRMING=false
+    start_slow_probe
+}
+
+consume_slow_probe() {
+    local now result="failed" current="" worker_status=0
+    local failure="worker exited without a result"
+    [[ -n "$SLOW_WORK_PID" ]] || return 0
+    now=$(wall_time) || return 1
+    if slow_probe_running; then
+        # Bound the entire worker as well as its individual inventory commands.
+        if (( now - SLOW_WORK_STARTED <= PROBE_TIMEOUT_SECONDS * 2 + 2 )); then
+            return 0
+        fi
+        failure="worker exceeded its time limit"
+    else
+        wait "$SLOW_WORK_PID" 2>/dev/null || worker_status=$?
+        if (( worker_status == 0 )) && [[ -f "$SLOW_WORK_DIR/result" ]]; then
+            result=$(<"$SLOW_WORK_DIR/result")
+            if [[ "$result" == failed ]]; then
+                failure="inventory command failed"
+            else
+                failure="invalid worker result"
+            fi
+        elif (( worker_status != 0 )); then
+            failure="worker exited with status $worker_status"
+        fi
+    fi
+    stop_slow_probe
+
+    if [[ "$result" != ok && "$result" != ok$'\n'* ]]; then
+        SLOW_HEALTHY=false
+        echo "$(/bin/date '+%H:%M:%S') SD/display sample failed ($failure; attempt $SLOW_WORK_ATTEMPT of $SLOW_WORK_LIMIT)."
+        write_state "degraded" "SD/display probe retrying"
+        if (( SLOW_WORK_ATTEMPT < SLOW_WORK_LIMIT )); then
+            start_slow_probe || runtime_probe_fault "SD/display worker" || true
+        else
+            runtime_probe_fault "SD/display" || true
+            SLOW_CONFIRMING=false
+        fi
+        return 0
+    fi
+    [[ "$result" == ok ]] || current=${result#*$'\n'}
+
+    if [[ "$SLOW_CONFIRMING" == true ]]; then
+        SLOW_BASE="$current"
+        SLOW_CONFIRMING=false
+        echo "$(/bin/date '+%H:%M:%S') Dry-run baseline updated."
+    elif [[ "$current" != "$SLOW_BASE" ]]; then
+        if ! process_change "$SLOW_BASE" "$current"; then
+            SLOW_CONFIRMING=true
+            SLOW_WORK_ATTEMPT=0
+            SLOW_WORK_LIMIT=$PROBE_RETRIES
+            start_slow_probe || {
+                SLOW_HEALTHY=false
+                runtime_probe_fault "SD/display confirmation worker" || true
+                return 0
+            }
+        fi
+    fi
+    SLOW_HEALTHY=true
 }
 
 read_snapshot_with_retries() {
@@ -940,6 +1100,8 @@ monitor_loop() {
 
         if (( now_wall - last_cycle_wall > WAKE_GAP_SECONDS )); then
             write_state "settling" "system wake detected"
+            stop_slow_probe
+            SLOW_CONFIRMING=false
             /bin/sleep "$WAKE_SETTLE_SECONDS"
             # Re-register IOKit notifications after every wake. The listener can
             # exit or its stream can become unusable across system sleep even
@@ -977,7 +1139,9 @@ monitor_loop() {
             continue
         fi
 
-        if ! fast_current=$(get_fast_snapshot); then
+        if read_fast_snapshot_for_monitor; then
+            fast_current=$FAST_CURRENT
+        else
             FAST_HEALTHY=false
             write_state "degraded" "USB/Thunderbolt probe retrying"
             fast_current=$(read_snapshot_with_retries fast) || {
@@ -1006,35 +1170,14 @@ monitor_loop() {
         fi
         FAST_HEALTHY=true
 
+        consume_slow_probe
         cycle=$((cycle + 1))
-        if (( cycle >= SLOW_CYCLES )); then
+        if (( cycle >= SLOW_CYCLES )) && [[ -z "$SLOW_WORK_PID" ]]; then
             cycle=0
-            if ! slow_current=$(get_slow_snapshot); then
+            if ! begin_slow_check; then
                 SLOW_HEALTHY=false
-                write_state "degraded" "SD/display probe retrying"
-                slow_current=$(read_snapshot_with_retries slow) || {
-                    runtime_probe_fault "SD/display" || true
-                    last_cycle_wall=$(wall_time) || return 1
-                    continue
-                }
+                runtime_probe_fault "SD/display worker" || true
             fi
-            if [[ "$slow_current" != "$SLOW_BASE" ]]; then
-                # Match the fast path: enforce the first successful change,
-                # then use confirmation only for the dry-run baseline.
-                if ! process_change "$SLOW_BASE" "$slow_current"; then
-                    slow_current=$(read_snapshot_with_retries slow) || {
-                        SLOW_HEALTHY=false
-                        runtime_probe_fault "SD/display confirmation" || true
-                        last_cycle_wall=$(wall_time) || return 1
-                        continue
-                    }
-                    if [[ "$slow_current" != "$SLOW_BASE" ]]; then
-                        SLOW_BASE="$slow_current"
-                        echo "$(/bin/date '+%H:%M:%S') Dry-run baseline updated."
-                    fi
-                fi
-            fi
-            SLOW_HEALTHY=true
         fi
 
         write_heartbeat
@@ -1072,7 +1215,7 @@ main() {
     fi
 
     prepare_state
-    trap 'stop_usb_event_monitor; remove_owned_state' EXIT
+    trap 'stop_slow_probe; stop_usb_event_monitor; remove_owned_state' EXIT
     trap signal_exit SIGINT SIGTERM
 
     if ! initialize_baselines; then
@@ -1117,7 +1260,7 @@ main() {
         echo "USB events:     unavailable; polling fallback active"
     fi
     echo "USB/TB fallback: every ${FAST_INTERVAL}s plus probe time"
-    echo "SD/display:     every $((SLOW_CYCLES)) fast cycles plus probe time"
+    echo "SD/display:     background check after $((SLOW_CYCLES)) fast cycles"
     echo "After wake:     compare a new stable snapshot"
     echo "Dry run:        $DRY_RUN"
     echo "Shutdown:       $SHUTDOWN_POLICY"

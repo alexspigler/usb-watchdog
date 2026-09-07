@@ -79,6 +79,8 @@ unavailable. PID presence alone is not treated as healthy.
   or terminates a USB device or interface service. The listener is a scheduling
   signal only; the shell engine still collects and compares the authoritative
   snapshot.
+- During normal monitoring, a successfully observed USB change reaches the
+  selected shutdown response before the Thunderbolt probe starts.
 - A timed USB and Thunderbolt check remains active every 0.25 seconds plus probe
   execution time. This fallback continues if the listener exits, hangs, or
   emits an invalid message. While polling continues, the engine retries the
@@ -87,8 +89,10 @@ unavailable. PID presence alone is not treated as healthy.
 - USB fingerprints include location, vendor/product IDs, serial and product
   strings, USB and device revisions, device class, maximum control-packet size,
   configuration count, and a sorted profile of the interfaces macOS publishes.
-- SD cards and external displays are checked every 12 fast loops. The cadence is
-  12 waits and fast probes plus one slow probe, rather than exactly 3 seconds.
+- SD-card and external-display checks start after 12 fast loops and run in a
+  background worker. At most one slow sample runs at a time. The engine consumes
+  completed results between fast checks; slow probes and their retries do not
+  block USB monitoring. The cadence depends on probe time and event activity.
 - Every inventory command has a 3-second timeout and bounded retries.
 - In real mode, a persistent inventory-probe failure fails closed by initiating
   shutdown. In dry-run mode, it reports a fault and retains the last known-good
@@ -155,6 +159,19 @@ Run the regression suite and static checks:
 ./scripts/build_event_monitor.sh
 shellcheck usb_watchdog.sh scripts/build_app.sh scripts/build_event_monitor.sh
 ```
+
+Measure USB event handling safely with real inventory reads, a synthetic USB
+change, and both shutdown commands replaced by harmless test functions:
+
+```sh
+.venv/bin/python scripts/benchmark_latency.py --samples 10
+```
+
+Use `--baseline /absolute/path/to/previous/usb_watchdog.sh` to compare with an
+earlier engine. The benchmark reports event-to-shutdown-request latency while
+idle and during an SD/display probe. It excludes macOS's device-publication
+delay and the time needed to physically power off; it is not a maximum-response
+guarantee.
 
 `requirements-build.txt` records the complete dependency set used for the
 current local app build. `scripts/build_app.sh` removes only the ignored

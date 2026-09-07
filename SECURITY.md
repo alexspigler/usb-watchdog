@@ -23,6 +23,12 @@ observable hardware inventory rather than firmware authentication.
 - The native IOKit listener supplies scheduling hints only. Every notification
   still passes through the shell engine's bounded inventory probe, baseline
   comparison, and existing shutdown-policy path.
+- During normal monitoring, a successful USB difference is enforced before the
+  Thunderbolt probe. Slow SD/display samples and retries run in a child of the
+  trusted engine, using a private temporary directory and consuming results only
+  after successful worker exit. Partial output, a missing result, and timeout
+  are failures, not empty inventories. Only the parent compares results and
+  requests shutdown; disarm and wake discard any pending worker result.
 - In real mode, the root shell launches the separate, mutable listener at the
   requesting user's UID. Replacing that helper cannot create a new path to root
   code execution; false or missing hints cannot disable independent polling.

@@ -1,18 +1,12 @@
-"""
-py2app build script for the USB Watchdog menu bar app.
+"""Build the macOS menu-bar app with ./scripts/build_app.sh.
 
-Build a standalone .app:
-    ./scripts/build_app.sh
-
-The result lands in dist/USB Watchdog.app — self-contained (bundles its own
-Python, rumps, and the native event listener) and dock-less (LSUIElement),
-living only in the menu bar.
+The bundle in dist/USB Watchdog.app includes Python, rumps, and the event listener.
 """
 from setuptools import setup
 
 APP = ["usb_watchdog_gui.py"]
 DATA_FILES = ["usb_watchdog.sh"]
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 OPTIONS = {
     "argv_emulation": False,
     "excludes": ["tkinter"],

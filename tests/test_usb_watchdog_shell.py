@@ -423,7 +423,7 @@ class RuntimeChangeTests(unittest.TestCase):
             "}\n"
             "write_heartbeat() { :; }\n"
             "write_state() { :; }\n"
-            "get_fast_snapshot() { printf %s "
+            "read_fast_snapshot_for_monitor() { FAST_CURRENT="
             + shlex.quote(fast_initial)
             + "; }\n"
             "get_slow_snapshot() { printf %s "
@@ -453,7 +453,20 @@ class RuntimeChangeTests(unittest.TestCase):
         self.assertIn("FAST_BASE:BASE", result.stdout)
 
     def test_slow_change_is_enforced_before_reverting_confirmation(self):
-        result = self.run_monitor_cycle(slow_initial="CHANGED", slow_cycles=1)
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\n"
+            "SLOW_BASE=BASE\n"
+            "get_slow_snapshot() {\n"
+            "  if [[ $SLOW_CONFIRMING == true ]]; then printf BASE; else printf CHANGED; fi\n"
+            "}\n"
+            "process_change() { printf 'EVENT:%s->%s\\n' \"$1\" \"$2\"; return 1; }\n"
+            "begin_slow_check\n"
+            "wait \"$SLOW_WORK_PID\"\n"
+            "consume_slow_probe\n"
+            "wait \"$SLOW_WORK_PID\"\n"
+            "consume_slow_probe\n"
+            "printf 'SLOW_BASE:%s\\n' \"$SLOW_BASE\""
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
         self.assertIn("SLOW_BASE:BASE", result.stdout)
@@ -474,6 +487,217 @@ class RuntimeChangeTests(unittest.TestCase):
         self.assertEqual(result.stdout.count("EVENT:BASE->CHANGED"), 1)
         self.assertIn("FAULT:USB/Thunderbolt confirmation", result.stdout)
         self.assertIn("FAST_BASE:BASE", result.stdout)
+
+
+class ResponseLatencyTests(unittest.TestCase):
+    def test_usb_change_reaches_shutdown_before_thunderbolt_probe(self):
+        result = run_sourced(
+            "FAST_BASE=$'USB:old\\nTB:old'\n"
+            "get_usb_snapshot() { printf 'USB:new'; }\n"
+            "get_thunderbolt_snapshot() { echo 'UNEXPECTED THUNDERBOLT PROBE' >&2; return 1; }\n"
+            "SHUTDOWN_POLICY=force-immediately\n"
+            "request_graceful_shutdown() { exit 90; }\n"
+            "request_forced_halt() { echo HALT_REQUEST; exit 0; }\n"
+            "read_fast_snapshot_for_monitor"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HALT_REQUEST", result.stdout)
+        self.assertNotIn("UNEXPECTED", result.stderr)
+
+    def test_usb_hint_without_inventory_change_does_not_shutdown(self):
+        result = run_sourced(
+            "FAST_BASE=$'USB:old\\nTB:old'\n"
+            "get_usb_snapshot() { printf 'USB:old'; }\n"
+            "get_thunderbolt_snapshot() { printf 'TB:old'; }\n"
+            "process_change() { echo UNEXPECTED >&2; exit 90; }\n"
+            "read_fast_snapshot_for_monitor\n"
+            "printf '%s' \"$FAST_CURRENT\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "TB:old\nUSB:old")
+
+    def test_usb_failure_is_not_a_successful_empty_inventory(self):
+        result = run_sourced(
+            "FAST_BASE='USB:old'\n"
+            "get_usb_snapshot() { return 1; }\n"
+            "process_change() { echo UNEXPECTED >&2; exit 90; }\n"
+            "read_fast_snapshot_for_monitor"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("UNEXPECTED", result.stderr)
+
+    def test_usb_dry_run_confirms_after_reporting_and_preserves_other_devices(self):
+        result = run_sourced(
+            "DRY_RUN=true\n"
+            "FAST_BASE=$'TB:old\\nUSB:old'\n"
+            "get_usb_snapshot() { printf 'USB:new'; }\n"
+            "get_thunderbolt_snapshot() { printf 'TB:old'; }\n"
+            "read_snapshot_with_retries() { printf 'USB:old'; }\n"
+            "request_graceful_shutdown() { exit 90; }\n"
+            "request_forced_halt() { exit 91; }\n"
+            "read_fast_snapshot_for_monitor\n"
+            "printf 'BASE:%s\\nCURRENT:%s' \"$FAST_BASE\" \"$FAST_CURRENT\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("DRY RUN — shutdown required"), 1)
+        self.assertIn("BASE:TB:old\nUSB:old", result.stdout)
+        self.assertIn("CURRENT:TB:old\nUSB:old", result.stdout)
+
+    def test_pending_slow_probe_cannot_delay_usb_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "slow-started"
+            result = run_sourced(
+                "trap stop_slow_probe EXIT\n"
+                "FAST_BASE='USB:old'\nSLOW_BASE=BASE\n"
+                "WAKE_GAP_SECONDS=999999\nFAST_INTERVAL=0\n"
+                "get_slow_snapshot() { : > %s; /bin/sleep 0.6; printf BASE; }\n"
+                "begin_slow_check\n"
+                "while [[ ! -f %s ]]; do /bin/sleep 0.01; done\n"
+                "get_usb_snapshot() { printf 'USB:new'; }\n"
+                "get_thunderbolt_snapshot() { exit 90; }\n"
+                "SHUTDOWN_POLICY=force-immediately\n"
+                "request_graceful_shutdown() { exit 91; }\n"
+                "request_forced_halt() {\n"
+                "  slow_probe_running || exit 92\n"
+                "  echo HALT_WHILE_SLOW_PROBE_PENDING\n"
+                "  exit 0\n"
+                "}\n"
+                "monitor_loop"
+                % (shlex.quote(str(marker)), shlex.quote(str(marker)))
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("HALT_WHILE_SLOW_PROBE_PENDING", result.stdout)
+
+
+class BackgroundSlowProbeTests(unittest.TestCase):
+    def test_monitor_consumes_completed_workers_without_waiting_for_timeouts(self):
+        result = run_sourced(
+            "set -euo pipefail\nDRY_RUN=true\n"
+            "trap 'stop_slow_probe; stop_usb_event_monitor' EXIT\n"
+            "FAST_BASE='USB:base'\nSLOW_BASE=BASE\n"
+            "SLOW_CYCLES=1\nFAST_INTERVAL=0.05\nPROBE_TIMEOUT_SECONDS=0\n"
+            "completed_samples=0\n"
+            "stop_requested() { (( completed_samples >= 3 || SECONDS >= 5 )); }\n"
+            "write_heartbeat() { :; }\n"
+            "get_usb_snapshot() { printf 'USB:base'; }\n"
+            "get_thunderbolt_snapshot() { :; }\n"
+            "get_slow_snapshot() { /bin/sleep 0.02; printf BASE; }\n"
+            "runtime_probe_fault() { echo UNEXPECTED_FAULT; exit 90; }\n"
+            "eval \"$(declare -f consume_slow_probe | "
+            "/usr/bin/sed '1s/consume_slow_probe/original_consume_slow_probe/')\"\n"
+            "consume_slow_probe() {\n"
+            "  local previous_pid=$SLOW_WORK_PID\n"
+            "  original_consume_slow_probe\n"
+            "  if [[ -n $previous_pid && -z $SLOW_WORK_PID && $SLOW_HEALTHY == true ]]; then\n"
+            "    completed_samples=$((completed_samples + 1))\n"
+            "  fi\n"
+            "}\n"
+            "exec 9< <(exec /usr/bin/perl -e '$|=1; while (1) { print \"heartbeat\\n\"; select undef, undef, undef, 0.05; }')\n"
+            "EVENT_MONITOR_PID=$!\nEVENT_MONITOR_FD_OPEN=true\n"
+            "EVENT_MONITOR_ACTIVE=true\nEVENT_MONITOR_HEALTHY=true\n"
+            "monitor_loop\n"
+            "printf 'COMPLETED:%s\\n' \"$completed_samples\"\n"
+            "(( completed_samples >= 3 ))",
+            timeout=8,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("COMPLETED:3", result.stdout)
+
+    def test_partial_output_from_failed_worker_cannot_be_an_inventory(self):
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\nSLOW_BASE=BASE\nPROBE_RETRIES=0\n"
+            "get_slow_snapshot() { /bin/sleep 0.5; printf BASE; }\n"
+            "runtime_probe_fault() { echo FAULT; return 1; }\n"
+            "process_change() { echo UNEXPECTED_EVENT; exit 90; }\n"
+            "begin_slow_check\n"
+            "while [[ ! -f $SLOW_WORK_DIR/result ]]; do /bin/sleep 0.01; done\n"
+            "printf 'ok\\nCHANGED' > \"$SLOW_WORK_DIR/result\"\n"
+            "kill -KILL \"$SLOW_WORK_PID\"\n"
+            "wait \"$SLOW_WORK_PID\" 2>/dev/null || true\n"
+            "consume_slow_probe\n"
+            "printf 'BASE:%s' \"$SLOW_BASE\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FAULT", result.stdout)
+        self.assertNotIn("UNEXPECTED_EVENT", result.stdout)
+        self.assertIn("BASE:BASE", result.stdout)
+
+    def test_cancellation_discards_pending_result(self):
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\nSLOW_BASE=BASE\n"
+            "get_slow_snapshot() { /bin/sleep 0.3; printf CHANGED; }\n"
+            "process_change() { echo UNEXPECTED_EVENT; exit 90; }\n"
+            "begin_slow_check\ndirectory=$SLOW_WORK_DIR\n"
+            "stop_slow_probe\nconsume_slow_probe\n"
+            "[[ ! -e $directory && -z $SLOW_WORK_PID ]] || exit 91\n"
+            "printf 'BASE:%s' \"$SLOW_BASE\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("UNEXPECTED_EVENT", result.stdout)
+        self.assertIn("BASE:BASE", result.stdout)
+
+    def test_empty_sample_is_successful_and_private_directory_is_cleaned(self):
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\nSLOW_BASE=''\n"
+            "get_slow_snapshot() { return 0; }\n"
+            "begin_slow_check\n"
+            "directory=$SLOW_WORK_DIR\n"
+            "/usr/bin/stat -f '%OLp' \"$directory\"\n"
+            "wait \"$SLOW_WORK_PID\"\nconsume_slow_probe\n"
+            "[[ ! -e $directory ]] || exit 91\n"
+            "printf 'HEALTHY:%s' \"$SLOW_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("700", result.stdout)
+        self.assertIn("HEALTHY:true", result.stdout)
+
+    def test_retries_run_in_background_and_exhaustion_reaches_fault(self):
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\nSLOW_BASE=BASE\nPROBE_RETRIES=2\n"
+            "get_slow_snapshot() { return 1; }\n"
+            "runtime_probe_fault() { printf 'FAULT:%s\\n' \"$1\"; return 1; }\n"
+            "begin_slow_check\n"
+            "for attempt in 1 2 3; do\n"
+            "  wait \"$SLOW_WORK_PID\"\nconsume_slow_probe\n"
+            "done\n"
+            "printf 'ATTEMPTS:%s HEALTHY:%s BASE:%s PID:%s' "
+            "\"$SLOW_WORK_ATTEMPT\" \"$SLOW_HEALTHY\" \"$SLOW_BASE\" \"$SLOW_WORK_PID\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("FAULT:SD/display"), 1)
+        self.assertIn("ATTEMPTS:3 HEALTHY:false BASE:BASE PID:", result.stdout)
+
+    def test_failed_dry_run_confirmation_retains_baseline(self):
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\nSLOW_BASE=BASE\nPROBE_RETRIES=1\n"
+            "get_slow_snapshot() {\n"
+            "  if [[ $SLOW_CONFIRMING == true ]]; then return 1; else printf CHANGED; fi\n"
+            "}\n"
+            "process_change() { echo EVENT; return 1; }\n"
+            "runtime_probe_fault() { echo FAULT; return 1; }\n"
+            "begin_slow_check\nwait \"$SLOW_WORK_PID\"\nconsume_slow_probe\n"
+            "wait \"$SLOW_WORK_PID\"\nconsume_slow_probe\n"
+            "printf 'BASE:%s HEALTHY:%s' \"$SLOW_BASE\" \"$SLOW_HEALTHY\""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("EVENT", result.stdout)
+        self.assertIn("FAULT", result.stdout)
+        self.assertIn("BASE:BASE HEALTHY:false", result.stdout)
+
+    def test_stalled_worker_is_bounded_and_cannot_leave_health_true(self):
+        result = run_sourced(
+            "trap stop_slow_probe EXIT\nSLOW_BASE=BASE\nPROBE_RETRIES=0\n"
+            "get_slow_snapshot() { /bin/sleep 0.5; printf BASE; }\n"
+            "runtime_probe_fault() { echo FAULT; return 1; }\n"
+            "begin_slow_check\n"
+            "kill -STOP \"$SLOW_WORK_PID\"\n"
+            "SLOW_WORK_STARTED=0\nconsume_slow_probe\n"
+            "printf 'HEALTHY:%s PID:%s' \"$SLOW_HEALTHY\" \"$SLOW_WORK_PID\"",
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FAULT", result.stdout)
+        self.assertIn("HEALTHY:false PID:", result.stdout)
 
 
 class NativeEventMonitorTests(unittest.TestCase):
